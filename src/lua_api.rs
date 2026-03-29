@@ -5,23 +5,35 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     Move { target: Position, reason: String },
+    MoveTo { target: Position, reason: String },
     Harvest { target_id: String },
     Transfer { target_id: String, resource: String, amount: u32 },
     Idle { reason: String },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Position { pub x: i32, pub y: i32 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Position {
+    pub x: i32,
+    pub y: i32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NearbyEntity {
-    pub id: String, pub pos: Position, pub resource_amount: u32,
+    pub id: String,
+    pub pos: Position,
+    pub resource_amount: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitContext {
-    pub id: String, pub pos: Position, pub hp: u32, pub max_hp: u32,
-    pub energy: u32, pub carry_capacity: u32, pub carry: u32, pub tick: u64,
+    pub id: String,
+    pub pos: Position,
+    pub hp: u32,
+    pub max_hp: u32,
+    pub energy: u32,
+    pub carry_capacity: u32,
+    pub carry: u32,
+    pub tick: u64,
     pub nearby_sources: Vec<NearbyEntity>,
     pub nearby_spawns: Vec<NearbyEntity>,
     pub nearby_creeps: Vec<NearbyEntity>,
@@ -30,14 +42,24 @@ pub struct UnitContext {
 impl UnitContext {
     pub fn empty(id: &str, pos: Position) -> Self {
         UnitContext {
-            id: id.to_string(), pos, hp: 100, max_hp: 100, energy: 0,
-            carry_capacity: 50, carry: 0, tick: 0,
-            nearby_sources: vec![], nearby_spawns: vec![], nearby_creeps: vec![],
+            id: id.to_string(),
+            pos,
+            hp: 100,
+            max_hp: 100,
+            energy: 0,
+            carry_capacity: 50,
+            carry: 0,
+            tick: 0,
+            nearby_sources: vec![],
+            nearby_spawns: vec![],
+            nearby_creeps: vec![],
         }
     }
 }
 
-pub struct ScriptEngine { lua: Lua }
+pub struct ScriptEngine {
+    lua: Lua,
+}
 
 impl ScriptEngine {
     pub fn new() -> LuaResult<Self> {
@@ -49,7 +71,8 @@ impl ScriptEngine {
             local _mt = getmetatable(_G) or {}
             _mt.__index = function(_, key) return nil end
             setmetatable(_G, _mt)
-        "#).exec()?;
+        "#)
+        .exec()?;
         tracing::info!("Lua VM created");
         Ok(Self { lua })
     }
@@ -81,6 +104,15 @@ impl ScriptEngine {
     pub fn global_is_nil(&self, name: &str) -> LuaResult<bool> {
         let val: Value = self.lua.globals().get(name)?;
         Ok(matches!(val, Value::Nil))
+    }
+
+    /// Предоставляет доступ к Lua-инстансу для регистрации глобальных функций.
+    /// Замыкание может возвращать ошибку — она пробросится наверх.
+    pub fn with_lua<F, R>(&self, f: F) -> LuaResult<R>
+    where
+        F: FnOnce(&Lua) -> LuaResult<R>,
+    {
+        f(&self.lua)
     }
 
     fn context_to_lua(&self, ctx: &UnitContext) -> LuaResult<Table> {
@@ -119,19 +151,45 @@ impl ScriptEngine {
     }
 
     fn parse_action(&self, table: Table) -> LuaResult<Action> {
-        let action_type: String = table.get("type")
+        let action_type: String = table
+            .get("type")
             .map_err(|_| mlua::Error::external("Action missing 'type'"))?;
         match action_type.as_str() {
             "move" => {
                 let target: Table = table.get("target")?;
-                Ok(Action::Move { target: Position { x: target.get("x")?, y: target.get("y")? },
-                    reason: table.get("reason").unwrap_or_default() })
+                Ok(Action::Move {
+                    target: Position {
+                        x: target.get("x")?,
+                        y: target.get("y")?,
+                    },
+                    reason: table.get("reason").unwrap_or_default(),
+                })
             }
-            "harvest" => Ok(Action::Harvest { target_id: table.get("target_id")? }),
-            "transfer" => Ok(Action::Transfer { target_id: table.get("target_id")?,
-                resource: table.get("resource")?, amount: table.get("amount")? }),
-            "idle" => Ok(Action::Idle { reason: table.get("reason").unwrap_or_default() }),
-            other => Err(mlua::Error::external(format!("Unknown action: '{}'", other))),
+            "moveto" => {
+                let target: Table = table.get("target")?;
+                Ok(Action::MoveTo {
+                    target: Position {
+                        x: target.get("x")?,
+                        y: target.get("y")?,
+                    },
+                    reason: table.get("reason").unwrap_or_default(),
+                })
+            }
+            "harvest" => Ok(Action::Harvest {
+                target_id: table.get("target_id")?,
+            }),
+            "transfer" => Ok(Action::Transfer {
+                target_id: table.get("target_id")?,
+                resource: table.get("resource")?,
+                amount: table.get("amount")?,
+            }),
+            "idle" => Ok(Action::Idle {
+                reason: table.get("reason").unwrap_or_default(),
+            }),
+            other => Err(mlua::Error::external(format!(
+                "Unknown action: '{}'",
+                other
+            ))),
         }
     }
 }
@@ -139,29 +197,72 @@ impl ScriptEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_decide_with_nearby() {
         let engine = ScriptEngine::new().unwrap();
-        engine.load_script_from_str(r#"
+        engine
+            .load_script_from_str(
+                r#"
             function decide(ctx)
                 if #ctx.nearby_sources > 0 then return { type = "harvest", target_id = ctx.nearby_sources[1].id } end
                 return { type = "idle", reason = "no sources" }
             end
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let mut ctx = UnitContext::empty("c1", Position { x: 0, y: 0 });
-        ctx.nearby_sources.push(NearbyEntity { id: "src1".into(), pos: Position { x: 3, y: 3 }, resource_amount: 100 });
-        assert!(matches!(engine.call_decide(&ctx).unwrap(), Action::Harvest { target_id } if target_id == "src1"));
+        ctx.nearby_sources.push(NearbyEntity {
+            id: "src1".into(),
+            pos: Position { x: 3, y: 3 },
+            resource_amount: 100,
+        });
+        assert!(matches!(
+            engine.call_decide(&ctx).unwrap(),
+            Action::Harvest { target_id } if target_id == "src1"
+        ));
     }
+
     #[test]
     fn test_distance_builtin() {
         let engine = ScriptEngine::new().unwrap();
-        engine.load_script_from_str(r#"
+        engine
+            .load_script_from_str(
+                r#"
             function decide(ctx)
                 local d = distance({x=0,y=0}, {x=3,y=4})
                 if d == 7 then return { type = "idle", reason = "ok" } end
                 return { type = "idle", reason = "wrong" }
             end
-        "#).unwrap();
-        assert!(matches!(engine.call_decide(&UnitContext::empty("c1", Position { x: 0, y: 0 })).unwrap(), Action::Idle { .. }));
+        "#,
+            )
+            .unwrap();
+        assert!(matches!(
+            engine
+                .call_decide(&UnitContext::empty("c1", Position { x: 0, y: 0 }))
+                .unwrap(),
+            Action::Idle { .. }
+        ));
+    }
+
+    #[test]
+    fn test_moveto_action() {
+        let engine = ScriptEngine::new().unwrap();
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                return { type = "moveto", target = { x = 5, y = 5 }, reason = "going there" }
+            end
+        "#,
+            )
+            .unwrap();
+        let action = engine
+            .call_decide(&UnitContext::empty("c1", Position { x: 0, y: 0 }))
+            .unwrap();
+        assert!(matches!(
+            action,
+            Action::MoveTo { target, reason } if target.x == 5 && target.y == 5 && reason == "going there"
+        ));
     }
 }
