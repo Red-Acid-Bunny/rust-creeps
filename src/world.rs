@@ -667,16 +667,6 @@ impl World {
         true
     }
 
-    /// Проверяет, занята ли позиция другим крипом.
-    /// exclude_id — id крипа, которого нужно исключить из проверки.
-    fn is_occupied_by_creep(&self, pos: Position, exclude_id: &str) -> bool {
-        self.entities.iter().any(|e| {
-            e.entity_type == EntityType::Creep
-                && e.pos == pos
-                && e.id != exclude_id
-        })
-    }
-
     pub fn step_toward(&self, from: Position, to: Position) -> Option<Position> {
         if from == to {
             return None;
@@ -845,9 +835,6 @@ impl World {
                             break;
                         }
                         if let Some(next_pos) = self.step_toward(pos, *target) {
-                            if self.is_occupied_by_creep(next_pos, creep_id) {
-                                break; // can't move there, another creep is in the way
-                            }
                             let next_tile = self.tiles[next_pos.y as usize][next_pos.x as usize];
                             let step_cost = tile_move_cost(next_tile);
 
@@ -973,7 +960,7 @@ impl World {
                             break;
                         }
 
-                        if self.is_walkable(path[i]) && !self.is_occupied_by_creep(path[i], creep_id) {
+                        if self.is_walkable(path[i]) {
                             final_pos = path[i];
                             steps_taken = i;
                             move_points -= step_cost;
