@@ -1,7 +1,7 @@
 use crate::lua_api::{Action, NearbyEntity, Position, ScriptEngine, UnitContext};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 // ═══════════════════════════════════════
 //  Типы тайлов и сущностей
@@ -497,12 +497,13 @@ impl World {
             return Some(target);
         }
         let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-        let mut visited = vec![target];
+        let mut visited: HashSet<Position> = HashSet::new();
+        visited.insert(target);
         let w = self.width as i32;
         let h = self.height as i32;
         for _ in 1..=max_dist {
-            let mut frontier = Vec::new();
-            for pos in &visited {
+            let mut frontier: Vec<Position> = Vec::new();
+            for &pos in &visited {
                 for &(dx, dy) in &directions {
                     let next = Position { x: pos.x + dx, y: pos.y + dy };
                     if next.x >= 0 && next.y >= 0 && next.x < w && next.y < h {
@@ -515,7 +516,9 @@ impl World {
                     }
                 }
             }
-            visited.extend(frontier);
+            for pos in frontier {
+                visited.insert(pos);
+            }
             if visited.len() > (max_dist as usize * max_dist as usize * 4) {
                 break; // safety limit
             }
@@ -662,6 +665,16 @@ impl World {
             }
         }
         true
+    }
+
+    /// Проверяет, занята ли позиция другим крипом.
+    /// exclude_id — id крипа, которого нужно исключить из проверки.
+    fn is_occupied_by_creep(&self, pos: Position, exclude_id: &str) -> bool {
+        self.entities.iter().any(|e| {
+            e.entity_type == EntityType::Creep
+                && e.pos == pos
+                && e.id != exclude_id
+        })
     }
 
     pub fn step_toward(&self, from: Position, to: Position) -> Option<Position> {
@@ -832,6 +845,9 @@ impl World {
                             break;
                         }
                         if let Some(next_pos) = self.step_toward(pos, *target) {
+                            if self.is_occupied_by_creep(next_pos, creep_id) {
+                                break; // can't move there, another creep is in the way
+                            }
                             let next_tile = self.tiles[next_pos.y as usize][next_pos.x as usize];
                             let step_cost = tile_move_cost(next_tile);
 
@@ -957,7 +973,7 @@ impl World {
                             break;
                         }
 
-                        if self.is_walkable(path[i]) {
+                        if self.is_walkable(path[i]) && !self.is_occupied_by_creep(path[i], creep_id) {
                             final_pos = path[i];
                             steps_taken = i;
                             move_points -= step_cost;
