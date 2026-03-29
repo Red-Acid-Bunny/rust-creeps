@@ -34,6 +34,9 @@ pub enum BodyPart {
 /// Plain = 1 очко, Swamp = SWAMP_COST очков.
 pub const SWAMP_COST: u32 = 2;
 
+/// Кулдаун спавна в тиках после создания крипа.
+pub const SPAWN_COOLDOWN_TICKS: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
     pub id: String,
@@ -50,6 +53,14 @@ pub struct Entity {
     /// Путь включает все позиции от старта до цели.
     #[serde(default)]
     pub planned_path: Vec<Position>,
+    /// Последнее действие крипа (используется для проверки столкновений).
+    /// Source и Spawn не используют это поле.
+    #[serde(default)]
+    pub last_action: Option<Action>,
+    /// Кулдаун спавна: оставшиеся тики до следующего создания крипа.
+    /// Только для EntityType::Spawn.
+    #[serde(default)]
+    pub spawn_cooldown: u32,
 }
 
 impl Entity {
@@ -66,6 +77,8 @@ impl Entity {
             body: vec![],
             resource_amount: amount,
             planned_path: vec![],
+            last_action: None,
+            spawn_cooldown: 0,
         }
     }
 
@@ -82,6 +95,8 @@ impl Entity {
             body: vec![],
             resource_amount: 0,
             planned_path: vec![],
+            last_action: None,
+            spawn_cooldown: 0,
         }
     }
 
@@ -107,6 +122,8 @@ impl Entity {
             body,
             resource_amount: 0,
             planned_path: vec![],
+            last_action: None,
+            spawn_cooldown: 0,
         }
     }
 
@@ -128,6 +145,34 @@ impl Entity {
     pub fn has_capacity(&self) -> bool {
         self.carry < self.carry_capacity
     }
+}
+
+/// Стоимость создания одной body part (в единицах энергии).
+pub fn body_part_cost(part: &BodyPart) -> u32 {
+    match part {
+        BodyPart::Move => 50,
+        BodyPart::Work => 100,
+        BodyPart::Carry => 50,
+        BodyPart::Attack => 80,
+        BodyPart::Tough => 10,
+    }
+}
+
+/// Парсит строку Lua в BodyPart. Возвращает None если имя неизвестно.
+pub fn parse_body_part(s: &str) -> Option<BodyPart> {
+    match s.to_lowercase().as_str() {
+        "move" => Some(BodyPart::Move),
+        "work" => Some(BodyPart::Work),
+        "carry" => Some(BodyPart::Carry),
+        "attack" => Some(BodyPart::Attack),
+        "tough" => Some(BodyPart::Tough),
+        _ => None,
+    }
+}
+
+/// Считает общую стоимость набора body parts.
+pub fn body_cost(parts: &[BodyPart]) -> u32 {
+    parts.iter().map(body_part_cost).sum()
 }
 
 // ═══════════════════════════════════════
@@ -644,6 +689,13 @@ impl World {
     }
 
     pub fn tick(&mut self, engine: &ScriptEngine) {
+        // Уменьшаем кулдауны спавнов на 1
+        for entity in &mut self.entities {
+            if entity.entity_type == EntityType::Spawn && entity.spawn_cooldown > 0 {
+                entity.spawn_cooldown -= 1;
+            }
+        }
+
         let creep_ids: Vec<String> = self
             .entities
             .iter()
@@ -681,6 +733,7 @@ impl World {
                 id: e.id.clone(),
                 pos: e.pos,
                 resource_amount: e.resource_amount,
+                cooldown: 0,
             })
             .collect();
         let spawns: Vec<NearbyEntity> = self
@@ -690,6 +743,7 @@ impl World {
                 id: e.id.clone(),
                 pos: e.pos,
                 resource_amount: e.energy,
+                cooldown: e.spawn_cooldown,
             })
             .collect();
         let creeps: Vec<NearbyEntity> = self
@@ -700,6 +754,7 @@ impl World {
                 id: e.id.clone(),
                 pos: e.pos,
                 resource_amount: e.carry,
+                cooldown: 0,
             })
             .collect();
 
@@ -719,6 +774,11 @@ impl World {
     }
 
     fn apply_action(&mut self, creep_id: &str, action: &Action) {
+        // Записываем last_action на сущность (для проверки столкновений)
+        if let Some(c) = self.get_entity_mut(creep_id) {
+            c.last_action = Some(action.clone());
+        }
+
         // Очищаем запланированный путь для всех действий кроме MoveTo
         if !matches!(action, Action::MoveTo { .. }) {
             if let Some(c) = self.get_entity_mut(creep_id) {
@@ -1001,6 +1061,106 @@ impl World {
                 }
             }
 
+            Action::Spawn {
+                target_id,
+                body,
+                name,
+            } => {
+                // 1. Найти спавн
+                let spawn = self.get_entity(target_id).cloned();
+                if let Some(spawn) = spawn {
+                    if spawn.entity_type != EntityType::Spawn {
+                        tracing::warn!(target_id = %target_id, "spawn failed: target is not a Spawn");
+                        return;
+                    }
+                    if spawn.spawn_cooldown > 0 {
+                        tracing::debug!(
+                            target_id = %target_id,
+                            cooldown = spawn.spawn_cooldown,
+                            "spawn failed: cooldown"
+                        );
+                        return;
+                    }
+                    // 2. Парсим body parts
+                    let mut parts = Vec::new();
+                    for part_str in body {
+                        match parse_body_part(part_str) {
+                            Some(p) => parts.push(p),
+                            None => {
+                                tracing::warn!(
+                                    unknown_part = %part_str,
+                                    "spawn failed: unknown body part"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    if parts.is_empty() {
+                        tracing::warn!("spawn failed: empty body");
+                        return;
+                    }
+                    // 3. Проверяем стоимость
+                    let cost = body_cost(&parts);
+                    if cost > spawn.energy {
+                        tracing::debug!(
+                            target_id = %target_id,
+                            cost,
+                            available = spawn.energy,
+                            "spawn failed: not enough energy"
+                        );
+                        return;
+                    }
+                    // 4. Ищем свободную клетку рядом со спавном
+                    let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+                    let mut spawn_pos = None;
+                    for &(dx, dy) in &directions {
+                        let next = Position {
+                            x: spawn.pos.x + dx,
+                            y: spawn.pos.y + dy,
+                        };
+                        if self.is_walkable(next) {
+                            spawn_pos = Some(next);
+                            break;
+                        }
+                    }
+                    let spawn_pos = match spawn_pos {
+                        Some(p) => p,
+                        None => {
+                            tracing::warn!(
+                                target_id = %target_id,
+                                "spawn failed: no adjacent walkable cell"
+                            );
+                            return;
+                        }
+                    };
+                    // 5. Генерируем ID
+                    let creep_name = if name.is_empty() {
+                        format!("worker_{}", self.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count() + 1)
+                    } else {
+                        name.clone()
+                    };
+                    // 6. Создаём крипа
+                    let new_creep = Entity::new_creep(&creep_name, spawn_pos, parts);
+                    tracing::info!(
+                        target_id = %target_id,
+                        new_id = %creep_name,
+                        cost,
+                        pos.x = spawn_pos.x,
+                        pos.y = spawn_pos.y,
+                        body = ?body,
+                        "spawned creep"
+                    );
+                    // 7. Тратим энергию и ставим кулдаун
+                    if let Some(s) = self.get_entity_mut(target_id) {
+                        s.energy -= cost;
+                        s.spawn_cooldown = SPAWN_COOLDOWN_TICKS;
+                    }
+                    self.entities.push(new_creep);
+                } else {
+                    tracing::warn!(target_id = %target_id, "spawn failed: spawn not found");
+                }
+            }
+
             Action::Idle { reason } => {
                 tracing::info!(reason = %reason, "idle");
             }
@@ -1089,6 +1249,9 @@ impl World {
                 amount,
             } => println!("TRANSFER {} {} -> {}", amount, resource, target_id),
             Action::Idle { reason } => println!("IDLE [{}]", reason),
+            Action::Spawn { target_id, body, name } => {
+                println!("SPAWN {} body={:?} name={}", target_id, body, name)
+            }
         }
         println!();
         println!("  Legend: # wall | . plain | S spawn | E source | c/C creep");
@@ -1252,5 +1415,120 @@ mod tests {
         for pos in &p[1..p.len() - 1] {
             assert_ne!(*pos, blocker);
         }
+    }
+
+    #[test]
+    fn test_body_part_cost() {
+        assert_eq!(body_part_cost(&BodyPart::Move), 50);
+        assert_eq!(body_part_cost(&BodyPart::Work), 100);
+        assert_eq!(body_part_cost(&BodyPart::Carry), 50);
+        assert_eq!(body_part_cost(&BodyPart::Attack), 80);
+        assert_eq!(body_part_cost(&BodyPart::Tough), 10);
+    }
+
+    #[test]
+    fn test_body_cost_sum() {
+        let parts = vec![BodyPart::Move, BodyPart::Move, BodyPart::Work, BodyPart::Carry];
+        assert_eq!(body_cost(&parts), 250); // 50+50+100+50
+    }
+
+    #[test]
+    fn test_parse_body_part() {
+        assert_eq!(parse_body_part("move"), Some(BodyPart::Move));
+        assert_eq!(parse_body_part("Move"), Some(BodyPart::Move));
+        assert_eq!(parse_body_part("MOVE"), Some(BodyPart::Move));
+        assert_eq!(parse_body_part("work"), Some(BodyPart::Work));
+        assert_eq!(parse_body_part("carry"), Some(BodyPart::Carry));
+        assert_eq!(parse_body_part("attack"), Some(BodyPart::Attack));
+        assert_eq!(parse_body_part("tough"), Some(BodyPart::Tough));
+        assert_eq!(parse_body_part("fly"), None);
+        assert_eq!(parse_body_part(""), None);
+    }
+
+    #[test]
+    fn test_spawn_creep_basic() {
+        let mut world = World::from_map(&[
+            "#####",
+            "#S.c#",
+            "#####",
+        ]);
+        let spawn_id = "spawn1".to_string();
+        let creep_id = "worker_1".to_string();
+
+        // Спавн: 300 энергии, кулдаун = 0
+        let cost = body_cost(&[BodyPart::Move, BodyPart::Move, BodyPart::Work, BodyPart::Carry]); // 250
+        assert!(world.get_entity(&spawn_id).unwrap().energy >= cost);
+
+        world.apply_action(
+            &creep_id,
+            &Action::Spawn {
+                target_id: spawn_id.clone(),
+                body: vec!["move".into(), "move".into(), "work".into(), "carry".into()],
+                name: "worker_2".into(),
+            },
+        );
+
+        // Новый крип создан
+        assert!(world.get_entity("worker_2").is_some());
+        assert_eq!(world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(), 2);
+
+        // Энергия потрачена
+        let spawn = world.get_entity(&spawn_id).unwrap();
+        assert_eq!(spawn.energy, 300 - cost);
+
+        // Кулдаун установлен
+        assert_eq!(spawn.spawn_cooldown, SPAWN_COOLDOWN_TICKS);
+    }
+
+    #[test]
+    fn test_spawn_not_enough_energy() {
+        let mut world = World::from_map(&[
+            "#####",
+            "#S.c#",
+            "#####",
+        ]);
+        // Спавн пытается спавнить дорогого крипа
+        world.apply_action(
+            "worker_1",
+            &Action::Spawn {
+                target_id: "spawn1".into(),
+                body: vec!["move".into(), "move".into(), "work".into(), "carry".into(),
+                         "carry".into(), "carry".into()], // 400 энергии — больше чем есть
+                name: "expensive".into(),
+            },
+        );
+        // Крип НЕ создан — не хватает энергии
+        assert_eq!(world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(), 1);
+    }
+
+    #[test]
+    fn test_spawn_cooldown() {
+        let mut world = World::from_map(&[
+            "#####",
+            "#S.c#",
+            "#####",
+        ]);
+
+        // Первый спавн — успешно
+        world.apply_action(
+            "worker_1",
+            &Action::Spawn {
+                target_id: "spawn1".into(),
+                body: vec!["move".into(), "work".into(), "carry".into()],
+                name: "w2".into(),
+            },
+        );
+        assert_eq!(world.entities.len(), 3); // spawn + 2 creep
+
+        // Второй спавн сразу — кулдаун
+        world.apply_action(
+            "worker_1",
+            &Action::Spawn {
+                target_id: "spawn1".into(),
+                body: vec!["move".into(), "work".into(), "carry".into()],
+                name: "w3".into(),
+            },
+        );
+        assert_eq!(world.entities.len(), 3); // не создался
     }
 }

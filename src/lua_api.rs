@@ -8,6 +8,7 @@ pub enum Action {
     MoveTo { target: Position, reason: String },
     Harvest { target_id: String },
     Transfer { target_id: String, resource: String, amount: u32 },
+    Spawn { target_id: String, body: Vec<String>, name: String },
     Idle { reason: String },
 }
 
@@ -22,6 +23,10 @@ pub struct NearbyEntity {
     pub id: String,
     pub pos: Position,
     pub resource_amount: u32,
+    /// Для спавнов: оставшийся кулдаун в тиках (0 = готов к спавну).
+    /// Для источников и крипов: всегда 0.
+    #[serde(default)]
+    pub cooldown: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +150,7 @@ impl ScriptEngine {
             row.set("id", entity.id.clone())?;
             row.set("pos", pos)?;
             row.set("resource_amount", entity.resource_amount)?;
+            row.set("cooldown", entity.cooldown)?;
             table.set(i + 1, row)?;
         }
         Ok(table)
@@ -183,6 +189,14 @@ impl ScriptEngine {
                 resource: table.get("resource")?,
                 amount: table.get("amount")?,
             }),
+            "spawn" => {
+                let body: Vec<String> = table.get("body")?;
+                Ok(Action::Spawn {
+                    target_id: table.get("target_id")?,
+                    body,
+                    name: table.get("name").unwrap_or_default(),
+                })
+            }
             "idle" => Ok(Action::Idle {
                 reason: table.get("reason").unwrap_or_default(),
             }),
@@ -216,6 +230,7 @@ mod tests {
             id: "src1".into(),
             pos: Position { x: 3, y: 3 },
             resource_amount: 100,
+            cooldown: 0,
         });
         assert!(matches!(
             engine.call_decide(&ctx).unwrap(),
