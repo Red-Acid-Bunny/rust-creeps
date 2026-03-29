@@ -696,9 +696,26 @@ impl World {
                         return;
                     }
 
+                    // Если цель непроходима (стена, источник, спавн), ищем ближайшую
+                    // смежную проходимую клетку — крип подходит к ней и может
+                    // взаимодействовать с целью (harvest, transfer) с distance <= 1.
+                    let effective_target = if self.is_walkable(*target) {
+                        *target
+                    } else {
+                        let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+                        directions
+                            .iter()
+                            .map(|(dx, dy)| Position {
+                                x: target.x + dx,
+                                y: target.y + dy,
+                            })
+                            .find(|p| self.is_walkable(*p))
+                            .unwrap_or(*target)
+                    };
+
                     // Пересчитываем путь, если он пустой или ведёт к другой цели
                     let needs_recompute = creep.planned_path.is_empty()
-                        || creep.planned_path.last().copied() != Some(*target);
+                        || creep.planned_path.last().copied() != Some(effective_target);
 
                     let path = if needs_recompute {
                         let blockers = self.block_positions();
@@ -708,22 +725,35 @@ impl World {
                             self.height as i32,
                             &blockers,
                             creep.pos,
-                            *target,
+                            effective_target,
                             false,
                         ) {
                             Some(p) => {
+                                if effective_target != *target {
+                                    tracing::info!(
+                                        target.x = target.x, target.y = target.y,
+                                        effective.x = effective_target.x, effective.y = effective_target.y,
+                                        "target non-walkable, rerouted to adjacent cell"
+                                    );
+                                }
                                 tracing::debug!(
                                     from.x = creep.pos.x, from.y = creep.pos.y,
                                     target.x = target.x, target.y = target.y,
+                                    effective_target.x = effective_target.x, effective_target.y = effective_target.y,
                                     path_len = p.len(), "path computed"
                                 );
                                 p
                             }
                             None => {
-                                tracing::warn!(
-                                    target.x = target.x, target.y = target.y,
-                                    "no path found"
-                                );
+                                // Логируем WARN только если путь был пуст (первая попытка),
+                                // чтобы не спамить каждый тик при постоянной неудаче.
+                                if creep.planned_path.is_empty() {
+                                    tracing::warn!(
+                                        target.x = target.x, target.y = target.y,
+                                        effective_target.x = effective_target.x, effective_target.y = effective_target.y,
+                                        "no path found to target"
+                                    );
+                                }
                                 return;
                             }
                         }
