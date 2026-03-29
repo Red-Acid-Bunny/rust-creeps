@@ -181,7 +181,7 @@ impl World {
             }
         }
 
-        World {
+        let world = World {
             width,
             height,
             tiles,
@@ -192,7 +192,18 @@ impl World {
             last_action: Action::Idle {
                 reason: "world created".to_string(),
             },
-        }
+        };
+
+        tracing::info!(
+            width = world.width,
+            height = world.height,
+            creeps = world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(),
+            sources = world.entities.iter().filter(|e| e.entity_type == EntityType::Source).count(),
+            spawns = world.entities.iter().filter(|e| e.entity_type == EntityType::Spawn).count(),
+            "world created"
+        );
+
+        world
     }
 
     pub fn find_by_type(&self, entity_type: EntityType, pos: Position, range: i32) -> Vec<&Entity> {
@@ -279,9 +290,15 @@ impl World {
                 Some(c) => c,
                 None => continue,
             };
+
+            // Спан создаёт контекст: все события внутри будут
+            // автоматически содержать id крипа и номер тика
+            let span = tracing::info_span!("creep", id = %creep_id, tick = self.tick);
+            let _enter = span.enter();
+
             let ctx = self.build_unit_context(&creep);
             let action = engine.call_decide(&ctx).unwrap_or_else(|err| {
-                eprintln!("[{}] Lua error: {}", creep_id, err);
+                tracing::error!(error = %err, "Lua error during decide()");
                 Action::Idle {
                     reason: format!("script error: {}", err),
                 }
@@ -339,15 +356,27 @@ impl World {
 
     fn apply_action(&mut self, creep_id: &str, action: &Action) {
         match action {
-            Action::Move { target, .. } => {
+            Action::Move { target, reason } => {
                 let creep = self.get_entity(creep_id).cloned();
                 if let Some(creep) = creep {
-                    if creep.can_move() {
-                        if let Some(new_pos) = self.step_toward(creep.pos, *target) {
-                            if let Some(c) = self.get_entity_mut(creep_id) {
-                                c.pos = new_pos;
-                            }
+                    if !creep.can_move() {
+                        tracing::warn!("cannot move: no Move body part");
+                        return;
+                    }
+                    if let Some(new_pos) = self.step_toward(creep.pos, *target) {
+                        tracing::info!(
+                            from.x = creep.pos.x, from.y = creep.pos.y,
+                            to.x = new_pos.x, to.y = new_pos.y,
+                            %reason, "moved"
+                        );
+                        if let Some(c) = self.get_entity_mut(creep_id) {
+                            c.pos = new_pos;
                         }
+                    } else {
+                        tracing::warn!(
+                            target.x = target.x, target.y = target.y,
+                            "path blocked or already at target"
+                        );
                     }
                 }
             }
@@ -356,12 +385,22 @@ impl World {
                 let source = self.get_entity(target_id).cloned();
                 if let (Some(creep), Some(source)) = (creep, source) {
                     if source.entity_type != EntityType::Source {
+                        tracing::warn!(target_id = %target_id, "harvest failed: target is not a Source");
                         return;
                     }
                     if Self::distance(creep.pos, source.pos) > 1 {
+                        tracing::warn!(target_id = %target_id, "harvest failed: not adjacent to source");
                         return;
                     }
-                    if !creep.can_work() || !creep.has_capacity() {
+                    if !creep.can_work() {
+                        tracing::warn!("harvest failed: no Work body part");
+                        return;
+                    }
+                    if !creep.has_capacity() {
+                        tracing::warn!(
+                            carry = creep.carry, capacity = creep.carry_capacity,
+                            "harvest failed: carry full"
+                        );
                         return;
                     }
                     let amount = self
@@ -369,32 +408,55 @@ impl World {
                         .min(source.resource_amount)
                         .min(creep.carry_capacity - creep.carry);
                     if amount > 0 {
+                        tracing::info!(
+                            target_id = %target_id,
+                            amount,
+                            source_remaining = source.resource_amount - amount,
+                            "harvested"
+                        );
                         if let Some(s) = self.get_entity_mut(target_id) {
                             s.resource_amount -= amount;
                         }
                         if let Some(c) = self.get_entity_mut(creep_id) {
                             c.carry += amount;
                         }
+                    } else {
+                        tracing::warn!(target_id = %target_id, "harvest skipped: source depleted");
                     }
                 }
             }
             Action::Transfer {
                 target_id,
-                resource: _,
+                resource,
                 amount,
             } => {
                 let creep = self.get_entity(creep_id).cloned();
                 if let Some(creep) = creep {
                     let transfer = (*amount).min(creep.carry);
                     if transfer == 0 {
+                        tracing::info!("transfer skipped: nothing to carry");
                         return;
                     }
                     let target_pos = self.get_entity(target_id).map(|t| t.pos);
                     if let Some(tp) = target_pos {
                         if Self::distance(creep.pos, tp) > 1 {
+                            tracing::warn!(
+                                target_id = %target_id,
+                                distance = Self::distance(creep.pos, tp),
+                                "transfer failed: too far from target"
+                            );
                             return;
                         }
+                    } else {
+                        tracing::warn!(target_id = %target_id, "transfer failed: target not found");
+                        return;
                     }
+                    tracing::info!(
+                        target_id = %target_id,
+                        resource = %resource,
+                        amount = transfer,
+                        "transferred"
+                    );
                     if let Some(c) = self.get_entity_mut(creep_id) {
                         c.carry -= transfer;
                     }
@@ -403,7 +465,9 @@ impl World {
                     }
                 }
             }
-            Action::Idle { .. } => {}
+            Action::Idle { reason } => {
+                tracing::info!(reason = %reason, "idle");
+            }
         }
     }
 

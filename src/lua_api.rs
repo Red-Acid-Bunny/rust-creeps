@@ -41,6 +41,7 @@ pub struct ScriptEngine { lua: Lua }
 
 impl ScriptEngine {
     pub fn new() -> LuaResult<Self> {
+        tracing::debug!("creating Lua VM with sandbox");
         let lua = Lua::new();
         lua.load(r#"
             function distance(a, b) return math.abs(a.x - b.x) + math.abs(a.y - b.y) end
@@ -49,16 +50,26 @@ impl ScriptEngine {
             _mt.__index = function(_, key) return nil end
             setmetatable(_G, _mt)
         "#).exec()?;
+        tracing::info!("Lua VM created");
         Ok(Self { lua })
     }
 
     pub fn load_script(&self, path: &Path) -> LuaResult<()> {
+        tracing::info!(path = %path.display(), "loading script");
         let code = std::fs::read_to_string(path)
             .map_err(|e| mlua::Error::external(format!("Cannot read {}: {}", path.display(), e)))?;
-        self.lua.load(&code).exec()
+        self.lua.load(&code).exec().map_err(|e| {
+            tracing::error!(path = %path.display(), error = %e, "script execution failed");
+            e
+        })?;
+        tracing::info!(path = %path.display(), "script loaded successfully");
+        Ok(())
     }
 
-    pub fn load_script_from_str(&self, code: &str) -> LuaResult<()> { self.lua.load(code).exec() }
+    pub fn load_script_from_str(&self, code: &str) -> LuaResult<()> {
+        tracing::debug!("loading script from string");
+        self.lua.load(code).exec()
+    }
 
     pub fn call_decide(&self, context: &UnitContext) -> LuaResult<Action> {
         let ctx_table = self.context_to_lua(context)?;
