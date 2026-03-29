@@ -178,7 +178,7 @@ impl ScriptEngine {
             if let mlua::Value::Table(t) = creeps {
                 let mut entries: Vec<(String, String)> = Vec::new();
                 for pair in t.pairs::<mlua::Value, mlua::Table>() {
-                    if let (mlua::Value::String(id), Ok(info)) = pair {
+                    if let Ok((mlua::Value::String(id), info)) = pair {
                         let tick: mlua::Value = info.get("tick")?;
                         let carry: mlua::Value = info.get("carry")?;
                         let pos: mlua::Value = info.get("pos")?;
