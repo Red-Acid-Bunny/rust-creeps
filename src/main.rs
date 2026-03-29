@@ -2,35 +2,33 @@ mod game;
 mod render;
 mod script;
 
+use game::config::GameConfig;
+use game::renderer::Renderer;
 use game::state::GameState;
+use render::CliRenderer;
 use script::ScriptEngine;
 use std::thread;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const MAP: &[&str] = &[
-    "#############################",
-    "#S#...#...#......~~~~~~..#EE#",
-    "#.#.#.#.#.#.~~~~~~~~~~~..#EE#",
-    "#.#.#.#.#.#.~~.~~~~~~~~..#..#",
-    "#.#.#.#.#.#.~.........~c.#..#",
-    "#.#.#.#.#.#.~~~~~~~~.~~..#..#",
-    "#.#.#.#.#.#.~~~~~~~~.~~..#..#",
-    "#...#...#...~~~~~~~~..~.....#",
-    "#############################",
-];
-
-const TOTAL_TICKS: u64 = 4500;
-const TICK_DELAY_MS: u64 = 30;
-
 fn main() {
+    // ── Config ─────────────────────────────────────────────
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "maps/default.json".to_string());
+
+    let config = GameConfig::from_file(std::path::Path::new(&config_path)).unwrap_or_else(|e| {
+        eprintln!("Failed to load config from {}: {}", config_path, e);
+        std::process::exit(1);
+    });
+
     // ── Logging ───────────────────────────────────────────
-    // Архитектура: game logic (game/, script/) использует
-    // только tracing-макросы — без привязки к конкретному бэкенду.
-    // Бэкенд (file / console / будущий UI-layer) настраивается здесь.
+    // Architecture: game logic (game/, script/) uses
+    // only tracing macros — no backend dependency.
+    // Backend (file / console / future UI-layer) configured here.
     //
-    // Чтобы добавить вывод в UI, достаточно создать свой tracing Layer
-    // и подключить через .with(my_ui_layer) ниже.
+    // To add UI output, create a tracing Layer
+    // and connect via .with(my_ui_layer) below.
     let log_dir = std::path::Path::new("logs");
     std::fs::create_dir_all(log_dir).expect("Failed to create logs directory");
 
@@ -44,49 +42,47 @@ fn main() {
                 .with_ansi(false)
                 .with_target(false),
         )
-        // .with(my_custom_ui_layer)  // ← будущий UI-слой
+        // .with(my_custom_ui_layer)  // <- future UI layer
         .init();
 
     tracing::info!(
-        ticks = TOTAL_TICKS,
-        delay_ms = TICK_DELAY_MS,
-        script = "scripts/harvester.lua",
+        map = %config_path,
+        ticks = config.total_ticks,
+        delay_ms = config.tick_delay_ms,
+        script = %config.script_path,
         "CREEP-SIM started"
     );
 
     // ── Terminal banner ────────────────────────────────────
-    println!();
-    println!("╔══════════════════════════════════════╗");
-    println!("║      CREEP-SIM: World Demo           ║");
-    println!("╚══════════════════════════════════════╝");
-    println!();
-    println!("  Loading harvester.lua ...");
-    println!("  Running {} ticks ({}ms each)", TOTAL_TICKS, TICK_DELAY_MS);
+    // ── Renderer init ─────────────────────────────────────
+    let mut renderer = CliRenderer;
+    renderer.init(&config);
+
+    println!("  Loading {} ...", config.script_path);
+    println!("  Running {} ticks ({}ms each)", config.total_ticks, config.tick_delay_ms);
     println!("  Press Ctrl+C to stop");
     println!("  Log file: logs/rust-creeps.log");
     println!();
     thread::sleep(Duration::from_secs(2));
 
     // ── World setup ────────────────────────────────────────
-    let mut game = GameState::from_map(MAP);
-    game.view_range = 50;
+    let mut game = GameState::from_config(&config);
 
     let engine = ScriptEngine::new().expect("Failed to create Lua VM");
 
-    // Регистрируем Lua-функции, зависящие от состояния мира (find_path, get_tile)
-    game
-        .register_lua_functions(&engine)
+    // Register Lua functions that depend on world state (find_path, get_tile)
+    game.register_lua_functions(&engine)
         .expect("Failed to register world Lua functions");
 
     engine
-        .load_script(std::path::Path::new("scripts/harvester.lua"))
-        .expect("Failed to load harvester.lua");
+        .load_script(std::path::Path::new(&config.script_path))
+        .expect("Failed to load Lua script");
 
     // ── Game loop ──────────────────────────────────────────
-    for tick_num in 0..TOTAL_TICKS {
+    for tick_num in 0..config.total_ticks {
         game.tick(&engine);
-        render::render(&game, &engine);
-        thread::sleep(Duration::from_millis(TICK_DELAY_MS));
+        renderer.render_tick(&game, &engine);
+        thread::sleep(Duration::from_millis(config.tick_delay_ms));
 
         if tick_num > 0 && tick_num % 500 == 0 {
             tracing::info!(tick = tick_num, "simulation progress");
@@ -95,15 +91,8 @@ fn main() {
 
     tracing::info!(total_ticks = game.tick, "simulation complete");
 
-    // writer_guard dropped here → flushes remaining log entries
+    // writer_guard dropped here -> flushes remaining log entries
     drop(writer_guard);
 
-    print!("\x1B[2J\x1B[H");
-    println!();
-    println!("══════════════════════════════════════");
-    println!("  Simulation complete. {} ticks played.", game.tick);
-    println!("  Log file: logs/rust-creeps.log");
-    println!("  Run again: cargo run");
-    println!("══════════════════════════════════════");
-    println!();
+    renderer.shutdown();
 }
