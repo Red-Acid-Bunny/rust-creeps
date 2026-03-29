@@ -74,11 +74,10 @@ impl UnitContext {
 }
 
 /// Рекурсивно форматирует Lua-значение в компактную строку.
-/// depth — глубина рекурсии (лимит 2 уровня для компактности).
+/// depth=0: только скаляры + таблицы как "{N items}".
+/// depth=1: один уровень вложенности ключ=значение.
+/// depth>=2: "{...}"
 fn format_lua_value(value: &mlua::Value, depth: usize) -> String {
-    if depth > 2 {
-        return "{...}".to_string();
-    }
     match value {
         mlua::Value::Nil => "nil".to_string(),
         mlua::Value::Boolean(b) => b.to_string(),
@@ -86,23 +85,43 @@ fn format_lua_value(value: &mlua::Value, depth: usize) -> String {
         mlua::Value::Number(n) => format!("{:.0}", n),
         mlua::Value::String(s) => s.to_string_lossy().to_string(),
         mlua::Value::Table(t) => {
-            let mut parts: Vec<String> = Vec::new();
-            for pair in t.pairs::<mlua::Value, mlua::Value>() {
-                if let Ok((k, v)) = pair {
-                    let key_str = match &k {
-                        mlua::Value::String(s) => s.to_string_lossy().to_string(),
-                        mlua::Value::Integer(i) => i.to_string(),
-                        mlua::Value::Number(n) => format!("{:.0}", n),
-                        _ => "?".to_string(),
-                    };
-                    let val_str = format_lua_value(&v, depth + 1);
-                    parts.push(format!("{}={}", key_str, val_str));
+            if depth == 0 {
+                // На верхнем уровне показываем количество элементов
+                let count = t.pairs::<mlua::Value, mlua::Value>().count();
+                if count == 0 {
+                    "{}".to_string()
+                } else {
+                    format!("{{{} item(s)}}", count)
                 }
-            }
-            if parts.is_empty() {
-                "{}".to_string()
+            } else if depth >= 2 {
+                "{...}".to_string()
             } else {
-                format!("{{{}}}", parts.join(", "))
+                // depth == 1: один уровень вложенности, значения — скаляры или сокращение
+                let mut parts: Vec<String> = Vec::new();
+                for pair in t.pairs::<mlua::Value, mlua::Value>() {
+                    if let Ok((k, v)) = pair {
+                        let key_str = match &k {
+                            mlua::Value::String(s) => s.to_string_lossy().to_string(),
+                            mlua::Value::Integer(i) => i.to_string(),
+                            mlua::Value::Number(n) => format!("{:.0}", n),
+                            _ => "?".to_string(),
+                        };
+                        // Значения показываем как скаляры, вложенные таблицы — сокращение
+                        let val_str = match &v {
+                            mlua::Value::Table(sub) => {
+                                let sub_count = sub.pairs::<mlua::Value, mlua::Value>().count();
+                                format!("{{{} item(s)}}", sub_count)
+                            }
+                            _ => format_lua_value(&v, depth + 1),
+                        };
+                        parts.push(format!("{}={}", key_str, val_str));
+                    }
+                }
+                if parts.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("{{{}}}", parts.join(", "))
+                }
             }
         }
         mlua::Value::Function(_) => "[function]".to_string(),

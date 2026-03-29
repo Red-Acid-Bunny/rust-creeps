@@ -6,24 +6,20 @@
 --   decide(ctx) — вызывается для КАЖДОГО крипа индивидуально.
 --     Отвечает за движение, добычу и доставку ресурсов.
 
--- ═════════════════════════════════════════
+-- ═══════════════════════════════════════════════════
 --  Глобальный хук: управление спавном
--- ═══════════════════════════════════════
+-- ═══════════════════════════════════════════════════
 function before_tick(game)
-    -- Стоимость body parts (должна совпадать с Rust)
     local BODY_COST = { move = 50, work = 100, carry = 50, attack = 80, tough = 10 }
     local MAX_CREEPS = 3
 
     -- Инициализация Memory
     if not Memory.creeps then Memory.creeps = {} end
-    if not Memory.spawn_count then Memory.spawn_count = 0 end
 
-    -- Считаем живых крипов
-    local creep_count = 0
-    for _ in pairs(Memory.creeps) do creep_count = creep_count + 1 end
-
-    -- Лимит крипов
-    if creep_count >= MAX_CREEPS then
+    -- Считаем живых крипов через game.creeps от Rust,
+    -- а НЕ через Memory.creeps — Memory может устареть
+    -- (крип умер, скрипт перезагружен, и т.д.)
+    if #game.creeps >= MAX_CREEPS then
         return nil
     end
 
@@ -37,12 +33,14 @@ function before_tick(game)
             end
 
             if sp.resource_amount >= cost then
-                Memory.spawn_count = Memory.spawn_count + 1
+                -- Имя оставляем пустым — Rust сгенерирует уникальное
+                -- автоматически (worker_1, worker_2, ...).
+                -- Если имя занято, Rust добавит суффикс (worker_1_2).
                 return {
                     type = "spawn",
                     target_id = sp.id,
                     body = body,
-                    name = "worker_" .. Memory.spawn_count
+                    name = "",
                 }
             end
         end
@@ -51,9 +49,9 @@ function before_tick(game)
     return nil
 end
 
--- ═══════════════════════════════════════
+-- ═══════════════════════════════════════════════════
 --  Per-creep: decide(ctx)
--- ═══════════════════════════════════════
+-- ═══════════════════════════════════════════════════
 function decide(ctx)
     -- Обновляем Memory: помечаем себя живым
     Memory.creeps[ctx.id] = {
