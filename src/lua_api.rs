@@ -78,7 +78,13 @@ impl ScriptEngine {
             setmetatable(_G, _mt)
         "#)
         .exec()?;
-        tracing::info!("Lua VM created");
+
+        // Memory — глобальная персистентная таблица (как в Screeps).
+        // Доступна всем крипам во всех тиках. Выживает при перезагрузке скрипта
+        // (т.к. load_script не очищает глобалы).
+        let memory = lua.create_table()?;
+        lua.globals().set("Memory", memory)?;
+        tracing::info!("Lua VM created, Memory initialized");
         Ok(Self { lua })
     }
 
@@ -279,5 +285,97 @@ mod tests {
             action,
             Action::MoveTo { target, reason } if target.x == 5 && target.y == 5 && reason == "going there"
         ));
+    }
+
+    #[test]
+    fn test_memory_persists_between_calls() {
+        let engine = ScriptEngine::new().unwrap();
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                Memory.counter = (Memory.counter or 0) + 1
+                return { type = "idle", reason = "count=" .. Memory.counter }
+            end
+        "#,
+            )
+            .unwrap();
+        let ctx = UnitContext::empty("c1", Position { x: 0, y: 0 });
+
+        // Первый вызов
+        let a1 = engine.call_decide(&ctx).unwrap();
+        assert!(matches!(a1, Action::Idle { ref reason } if reason == "count=1"));
+
+        // Второй вызов — Memory.counter должен быть 2
+        let a2 = engine.call_decide(&ctx).unwrap();
+        assert!(matches!(a2, Action::Idle { ref reason } if reason == "count=2"));
+
+        // Третий вызов
+        let a3 = engine.call_decide(&ctx).unwrap();
+        assert!(matches!(a3, Action::Idle { ref reason } if reason == "count=3"));
+    }
+
+    #[test]
+    fn test_memory_shared_across_creeps() {
+        let engine = ScriptEngine::new().unwrap();
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                Memory.creeps = Memory.creeps or {}
+                Memory.creeps[ctx.id] = ctx.tick
+                local n = 0
+                for _ in pairs(Memory.creeps) do n = n + 1 end
+                return { type = "idle", reason = "known=" .. n }
+            end
+        "#,
+            )
+            .unwrap();
+
+        // Имитация двух крипов
+        let ctx1 = UnitContext::empty("worker_1", Position { x: 0, y: 0 });
+        let ctx2 = UnitContext::empty("worker_2", Position { x: 1, y: 0 });
+
+        let a1 = engine.call_decide(&ctx1).unwrap();
+        assert!(matches!(a1, Action::Idle { ref reason } if reason == "known=1"));
+
+        // worker_2 видит Memory.creeps с worker_1
+        let a2 = engine.call_decide(&ctx2).unwrap();
+        assert!(matches!(a2, Action::Idle { ref reason } if reason == "known=2"));
+    }
+
+    #[test]
+    fn test_memory_survives_script_reload() {
+        let engine = ScriptEngine::new().unwrap();
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                Memory.data = (Memory.data or 0) + 1
+                return { type = "idle", reason = "data=" .. Memory.data }
+            end
+        "#,
+            )
+            .unwrap();
+
+        let ctx = UnitContext::empty("c1", Position { x: 0, y: 0 });
+        engine.call_decide(&ctx).unwrap(); // data=1
+        engine.call_decide(&ctx).unwrap(); // data=2
+
+        // Перезагрузка скрипта
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                Memory.data = (Memory.data or 0) + 10
+                return { type = "idle", reason = "data=" .. Memory.data }
+            end
+        "#,
+            )
+            .unwrap();
+
+        // Memory.data должно быть 12 (2 + 10), а не 10
+        let a = engine.call_decide(&ctx).unwrap();
+        assert!(matches!(a, Action::Idle { ref reason } if reason == "data=12"));
     }
 }
