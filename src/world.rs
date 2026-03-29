@@ -1163,11 +1163,24 @@ impl World {
                             return;
                         }
                     };
-                    // 5. Генерируем ID
-                    let creep_name = if name.is_empty() {
+                    // 5. Генерируем уникальный ID
+                    let base_name = if name.is_empty() {
                         format!("worker_{}", self.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count() + 1)
                     } else {
                         name.clone()
+                    };
+                    let creep_name = if self.get_entity(&base_name).is_none() {
+                        base_name
+                    } else {
+                        // Имя занято — добавляем суффикс
+                        let mut suffix: u32 = 2;
+                        loop {
+                            let candidate = format!("{}_{}", base_name, suffix);
+                            if self.get_entity(&candidate).is_none() {
+                                break candidate;
+                            }
+                            suffix += 1;
+                        }
                     };
                     // 6. Создаём крипа
                     let new_creep = Entity::new_creep(&creep_name, spawn_pos, parts);

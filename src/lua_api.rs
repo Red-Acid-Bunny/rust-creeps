@@ -62,128 +62,43 @@ impl UnitContext {
     }
 }
 
-/// Форматирует Lua-число (Integer или Number) в строку.
-fn fmt_num(val: &mlua::Value) -> String {
-    match val {
-        mlua::Value::Integer(n) => n.to_string(),
-        mlua::Value::Number(n) => format!("{:.0}", n),
-        _ => "?".to_string(),
-    }
-}
-
-/// Рекурсивно форматирует Lua-значение в строки.
-/// indent — текущий отступ, depth — глубина рекурсии (лимит 3 уровня).
-fn format_lua_value(
-    value: &mlua::Value,
-    indent: &str,
-    lines: &mut Vec<String>,
-    depth: usize,
-) {
-    if depth > 3 {
-        lines.push(format!("{}...", indent));
-        return;
+/// Рекурсивно форматирует Lua-значение в компактную строку.
+/// depth — глубина рекурсии (лимит 2 уровня для компактности).
+fn format_lua_value(value: &mlua::Value, depth: usize) -> String {
+    if depth > 2 {
+        return "{...}".to_string();
     }
     match value {
-        mlua::Value::Nil => {}
-        mlua::Value::Boolean(b) => {
-            lines.push(format!("{}{}", indent, b));
-        }
-        mlua::Value::Integer(n) => {
-            lines.push(format!("{}{}", indent, n));
-        }
-        mlua::Value::Number(n) => {
-            lines.push(format!("{}{:.0}", indent, n));
-        }
-        mlua::Value::String(s) => {
-            lines.push(format!("{}{}", indent, s.to_string_lossy()));
-        }
+        mlua::Value::Nil => "nil".to_string(),
+        mlua::Value::Boolean(b) => b.to_string(),
+        mlua::Value::Integer(n) => n.to_string(),
+        mlua::Value::Number(n) => format!("{:.0}", n),
+        mlua::Value::String(s) => s.to_string_lossy().to_string(),
         mlua::Value::Table(t) => {
-            let child_indent = format!("{}  ", indent);
-            // Iterate pairs
-            let mut pairs: Vec<(String, mlua::Value)> = Vec::new();
-            // Check if it's an array (integer keys starting from 1)
-            let mut is_array = true;
-            let mut max_idx = 0usize;
+            let mut parts: Vec<String> = Vec::new();
             for pair in t.pairs::<mlua::Value, mlua::Value>() {
                 if let Ok((k, v)) = pair {
-                    match &k {
-                        mlua::Value::Integer(i) => {
-                            let idx = *i as usize;
-                            if idx == max_idx + 1 {
-                                max_idx = idx;
-                            } else {
-                                is_array = false;
-                            }
-                        }
-                        _ => {
-                            is_array = false;
-                        }
-                    }
                     let key_str = match &k {
                         mlua::Value::String(s) => s.to_string_lossy().to_string(),
                         mlua::Value::Integer(i) => i.to_string(),
+                        mlua::Value::Number(n) => format!("{:.0}", n),
                         _ => "?".to_string(),
                     };
-                    pairs.push((key_str, v));
+                    let val_str = format_lua_value(&v, depth + 1);
+                    parts.push(format!("{}={}", key_str, val_str));
                 }
             }
-            if pairs.is_empty() {
-                lines.push(format!("{}{{}}", indent));
-                return;
-            }
-            if is_array && max_idx > 0 {
-                // Array-like table: show indexed values
-                for (key_str, v) in &pairs {
-                    let prefix = format!("{}[{}] ", indent, key_str);
-                    match v {
-                        mlua::Value::Table(_) => {
-                            lines.push(format!("{}{{", prefix.trim_end()));
-                            format_lua_value(v, &child_indent, lines, depth + 1);
-                            lines.push(format!("{}  }}", indent));
-                        }
-                        _ => {
-                            let mut sub_lines = Vec::new();
-                            format_lua_value(v, "", &mut sub_lines, depth + 1);
-                            if sub_lines.len() == 1 {
-                                lines.push(format!("{}{}", prefix, sub_lines[0].trim()));
-                            }
-                        }
-                    }
-                }
+            if parts.is_empty() {
+                "{}".to_string()
             } else {
-                // Dict-like table: show key = value
-                for (key_str, v) in &pairs {
-                    match v {
-                        mlua::Value::Table(_) => {
-                            lines.push(format!("{}{} =", indent, key_str));
-                            lines.push(format!("{}{{", &child_indent));
-                            format_lua_value(v, &child_indent, lines, depth + 1);
-                            lines.push(format!("{}  }}", indent));
-                        }
-                        _ => {
-                            let mut sub_lines = Vec::new();
-                            format_lua_value(v, "", &mut sub_lines, depth + 1);
-                            if sub_lines.len() == 1 {
-                                lines.push(format!("{}{} = {}", indent, key_str, sub_lines[0].trim()));
-                            }
-                        }
-                    }
-                }
+                format!("{{{}}}", parts.join(", "))
             }
         }
-        mlua::Value::Function(_) => {
-            lines.push(format!("{}[function]", indent));
-        }
-        mlua::Value::UserData(_) | mlua::Value::LightUserData(_) => {
-            lines.push(format!("{}[userdata]", indent));
-        }
-        mlua::Value::Thread(_) => {
-            lines.push(format!("{}[thread]", indent));
-        }
-        mlua::Value::Error(e) => {
-            lines.push(format!("{}[error: {}]", indent, e));
-        }
-        _ => {}
+        mlua::Value::Function(_) => "[function]".to_string(),
+        mlua::Value::UserData(_) | mlua::Value::LightUserData(_) => "[userdata]".to_string(),
+        mlua::Value::Thread(_) => "[thread]".to_string(),
+        mlua::Value::Error(e) => format!("[error: {}]", e),
+        _ => "[?]".to_string(),
     }
 }
 
@@ -345,11 +260,23 @@ impl ScriptEngine {
         self.with_lua(|lua| {
             let memory: mlua::Table = lua.globals().get("Memory")?;
             let mut lines = Vec::new();
-            format_lua_value(&mlua::Value::Table(memory), "  ", &mut lines, 0);
-            if lines.is_empty() {
-                lines.push("  (empty)".to_string());
+            for pair in memory.pairs::<mlua::Value, mlua::Value>() {
+                if let Ok((k, v)) = pair {
+                    let key_str = match &k {
+                        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+                        mlua::Value::Integer(i) => i.to_string(),
+                        mlua::Value::Number(n) => format!("{:.0}", n),
+                        _ => continue,
+                    };
+                    let val_str = format_lua_value(&v, 1);
+                    lines.push(format!("  {} = {}", key_str, val_str));
+                }
             }
-            Ok(lines.join("\n"))
+            if lines.is_empty() {
+                Ok("  (empty)".to_string())
+            } else {
+                Ok(lines.join("\n"))
+            }
         })
     }
 
