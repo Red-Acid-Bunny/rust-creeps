@@ -792,24 +792,28 @@ impl World {
                         }
                     }
 
-                    let remaining: Vec<Position> = path.into_iter().skip(steps_taken + 1).collect();
+                    // Сохраняем оставшийся путь с текущей позицией в индексе 0.
+                    // Это критично: цикл `for i in 1..` всегда ожидает,
+                    // что path[0] = текущая позиция крипа.
+                    let mut cached_path = vec![final_pos];
+                    cached_path.extend(path.into_iter().skip(steps_taken + 1));
 
                     if final_pos != creep.pos {
                         tracing::info!(
                             from.x = creep.pos.x, from.y = creep.pos.y,
                             to.x = final_pos.x, to.y = final_pos.y,
                             steps = steps_taken,
-                            path_remaining = remaining.len(),
+                            path_remaining = cached_path.len() - 1,
                             %reason, "path move"
                         );
                     }
 
                     if let Some(c) = self.get_entity_mut(creep_id) {
                         c.pos = final_pos;
-                        c.planned_path = remaining;
+                        c.planned_path = cached_path;
                     }
 
-                    if final_pos == creep.pos && steps_taken == 0 && needs_recompute {
+                    if final_pos == creep.pos && steps_taken == 0 {
                         // Не смогли сдвинуться — очищаем путь для пересчёта
                         if let Some(c) = self.get_entity_mut(creep_id) {
                             c.planned_path.clear();
