@@ -1,77 +1,7 @@
 use mlua::{Lua, Result as LuaResult, Table, Value};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Контекст глобального хука before_tick(game).
-/// Передаётся один раз в начале каждого тика, ДО обработки крипов.
-/// Позволяет Lua-коду управлять спавном и другой глобальной логикой.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GameContext {
-    pub tick: u64,
-    pub creeps: Vec<NearbyEntity>,
-    pub spawns: Vec<NearbyEntity>,
-    pub sources: Vec<NearbyEntity>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Action {
-    Move { target: Position, reason: String },
-    MoveTo { target: Position, reason: String },
-    Harvest { target_id: String },
-    Transfer { target_id: String, resource: String, amount: u32 },
-    Spawn { target_id: String, body: Vec<String>, name: String },
-    Idle { reason: String },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct Position {
-    pub x: i32,
-    pub y: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NearbyEntity {
-    pub id: String,
-    pub pos: Position,
-    pub resource_amount: u32,
-    /// Для спавнов: оставшийся кулдаун в тиках (0 = готов к спавну).
-    /// Для источников и крипов: всегда 0.
-    #[serde(default)]
-    pub cooldown: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnitContext {
-    pub id: String,
-    pub pos: Position,
-    pub hp: u32,
-    pub max_hp: u32,
-    pub energy: u32,
-    pub carry_capacity: u32,
-    pub carry: u32,
-    pub tick: u64,
-    pub nearby_sources: Vec<NearbyEntity>,
-    pub nearby_spawns: Vec<NearbyEntity>,
-    pub nearby_creeps: Vec<NearbyEntity>,
-}
-
-impl UnitContext {
-    pub fn empty(id: &str, pos: Position) -> Self {
-        UnitContext {
-            id: id.to_string(),
-            pos,
-            hp: 100,
-            max_hp: 100,
-            energy: 0,
-            carry_capacity: 50,
-            carry: 0,
-            tick: 0,
-            nearby_sources: vec![],
-            nearby_spawns: vec![],
-            nearby_creeps: vec![],
-        }
-    }
-}
+use crate::game::types::*;
 
 /// Рекурсивно форматирует Lua-значение в компактную строку.
 /// depth=0: только скаляры + таблицы как "{N items}".
@@ -321,6 +251,7 @@ impl ScriptEngine {
         }
     }
 
+    #[allow(dead_code)]
     pub fn global_is_nil(&self, name: &str) -> LuaResult<bool> {
         let val: Value = self.lua.globals().get(name)?;
         Ok(matches!(val, Value::Nil))
