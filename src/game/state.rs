@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::game::config::GameConfig;
 use crate::game::pathfinding;
 use crate::game::types::*;
 use crate::script::ScriptEngine;
@@ -22,17 +23,26 @@ pub struct GameState {
 }
 
 impl GameState {
-    /// Создаёт мир из строкового описания карты
-    /// '#' стена  '~' болото  '.' пусто  'S' спавн  'E' источник  'c' крип
+    /// Creates the world from a string-based map description (backward compat for tests).
+    /// '#' wall  '~' swamp  '.' plain  'S' spawn  'E' source  'c' creep
     pub fn from_map(map_strings: &[&str]) -> Self {
-        let height = map_strings.len();
-        let width = map_strings.iter().map(|s| s.len()).max().unwrap_or(0);
+        let config = GameConfig::with_defaults(
+            map_strings.iter().map(|s| s.to_string()).collect(),
+        );
+        Self::from_config(&config)
+    }
+
+    /// Creates GameState from a GameConfig (loaded from JSON).
+    /// Uses config fields for spawn energy, source amounts, rates, etc.
+    pub fn from_config(config: &GameConfig) -> Self {
+        let height = config.map.len();
+        let width = config.map.iter().map(|s| s.len()).max().unwrap_or(0);
         let mut tiles = vec![vec![TileType::Plain; width]; height];
         let mut entities = Vec::new();
         let mut creep_count = 0u32;
         let mut source_count = 0u32;
 
-        for (y, row) in map_strings.iter().enumerate() {
+        for (y, row) in config.map.iter().enumerate() {
             for (x, ch) in row.chars().enumerate() {
                 if x >= width {
                     break;
@@ -49,7 +59,7 @@ impl GameState {
                             x: x as i32,
                             y: y as i32,
                         },
-                        300,
+                        config.spawn_initial_energy,
                     )),
                     'E' => {
                         source_count += 1;
@@ -59,7 +69,7 @@ impl GameState {
                                 x: x as i32,
                                 y: y as i32,
                             },
-                            1000,
+                            config.source_initial_amount,
                         ))
                     }
                     'c' => {
@@ -96,10 +106,10 @@ impl GameState {
             entities,
             entity_index,
             tick: 0,
-            view_range: 10,
-            harvest_rate: 10,
-            source_regen_rate: 1,
-            max_source_amount: 1000,
+            view_range: config.view_range,
+            harvest_rate: config.harvest_rate,
+            source_regen_rate: config.source_regen_rate,
+            max_source_amount: config.max_source_amount,
         };
 
         tracing::info!(
