@@ -1,7 +1,7 @@
-use crate::lua_api::{Action, NearbyEntity, Position, ScriptEngine, UnitContext};
+use crate::lua_api::{Action, GameContext, NearbyEntity, Position, ScriptEngine, UnitContext};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 // ═══════════════════════════════════════
 //  Типы тайлов и сущностей
@@ -497,12 +497,13 @@ impl World {
             return Some(target);
         }
         let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-        let mut visited = vec![target];
+        let mut visited: HashSet<Position> = HashSet::new();
+        visited.insert(target);
         let w = self.width as i32;
         let h = self.height as i32;
         for _ in 1..=max_dist {
-            let mut frontier = Vec::new();
-            for pos in &visited {
+            let mut frontier: Vec<Position> = Vec::new();
+            for &pos in &visited {
                 for &(dx, dy) in &directions {
                     let next = Position { x: pos.x + dx, y: pos.y + dy };
                     if next.x >= 0 && next.y >= 0 && next.x < w && next.y < h {
@@ -515,9 +516,11 @@ impl World {
                     }
                 }
             }
-            visited.extend(frontier);
+            for pos in frontier {
+                visited.insert(pos);
+            }
             if visited.len() > (max_dist as usize * max_dist as usize * 4) {
-                break; // safety limit
+                break;
             }
         }
         None
@@ -700,6 +703,155 @@ impl World {
         (a.x - b.x).abs() + (a.y - b.y).abs()
     }
 
+    /// Собирает GameContext для передачи в before_tick().
+    fn build_game_context(&self) -> GameContext {
+        let creeps: Vec<NearbyEntity> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Creep)
+            .map(|e| NearbyEntity {
+                id: e.id.clone(),
+                pos: e.pos,
+                resource_amount: e.carry,
+                cooldown: 0,
+            })
+            .collect();
+        let spawns: Vec<NearbyEntity> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Spawn)
+            .map(|e| NearbyEntity {
+                id: e.id.clone(),
+                pos: e.pos,
+                resource_amount: e.energy,
+                cooldown: e.spawn_cooldown,
+            })
+            .collect();
+        let sources: Vec<NearbyEntity> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Source)
+            .map(|e| NearbyEntity {
+                id: e.id.clone(),
+                pos: e.pos,
+                resource_amount: e.resource_amount,
+                cooldown: 0,
+            })
+            .collect();
+        GameContext { tick: self.tick, creeps, spawns, sources }
+    }
+
+    /// Обрабатывает экшен Spawn. Вынесен отдельно, чтобы вызывать
+    /// как из apply_action() (от крипа), так и из tick() (от before_tick).
+    /// Возвращает true если крип успешно создан.
+    fn process_spawn(&mut self, target_id: &str, body: &[String], name: &str) -> bool {
+        let spawn = match self.get_entity(target_id).cloned() {
+            Some(s) if s.entity_type == EntityType::Spawn => s,
+            Some(_) => {
+                tracing::warn!(target_id = %target_id, "spawn failed: target is not a Spawn");
+                return false;
+            }
+            None => {
+                tracing::warn!(target_id = %target_id, "spawn failed: spawn not found");
+                return false;
+            }
+        };
+
+        if spawn.spawn_cooldown > 0 {
+            tracing::debug!(
+                target_id = %target_id,
+                cooldown = spawn.spawn_cooldown,
+                "spawn failed: cooldown"
+            );
+            return false;
+        }
+
+        let mut parts = Vec::new();
+        for part_str in body {
+            match parse_body_part(part_str) {
+                Some(p) => parts.push(p),
+                None => {
+                    tracing::warn!(unknown_part = %part_str, "spawn failed: unknown body part");
+                    return false;
+                }
+            }
+        }
+        if parts.is_empty() {
+            tracing::warn!("spawn failed: empty body");
+            return false;
+        }
+
+        let cost = body_cost(&parts);
+        if cost > spawn.energy {
+            tracing::debug!(
+                target_id = %target_id,
+                cost,
+                available = spawn.energy,
+                "spawn failed: not enough energy"
+            );
+            return false;
+        }
+
+        // Ищем свободную клетку рядом со спавном
+        let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+        let spawn_pos = loop {
+            let mut found = None;
+            for &(dx, dy) in &directions {
+                let next = Position { x: spawn.pos.x + dx, y: spawn.pos.y + dy };
+                if self.is_walkable(next) {
+                    found = Some(next);
+                    break;
+                }
+            }
+            match found {
+                Some(p) => break p,
+                None => {
+                    tracing::warn!(target_id = %target_id, "spawn failed: no adjacent walkable cell");
+                    return false;
+                }
+            }
+        };
+
+        // Генерируем уникальный ID
+        let base_name = if name.is_empty() {
+            format!("worker_{}", self.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count() + 1)
+        } else {
+            name.to_string()
+        };
+        let creep_name = if self.get_entity(&base_name).is_none() {
+            base_name
+        } else {
+            let mut suffix: u32 = 2;
+            loop {
+                let candidate = format!("{}_{}", base_name, suffix);
+                if self.get_entity(&candidate).is_none() {
+                    break candidate;
+                }
+                suffix += 1;
+            }
+        };
+
+        let new_creep = Entity::new_creep(&creep_name, spawn_pos, parts);
+        tracing::info!(
+            target_id = %target_id,
+            new_id = %creep_name,
+            cost,
+            pos.x = spawn_pos.x,
+            pos.y = spawn_pos.y,
+            body = ?body,
+            "spawned creep"
+        );
+
+        // Тратим энергию и ставим кулдаун
+        if let Some(s) = self.get_entity_mut(target_id) {
+            s.energy -= cost;
+            s.spawn_cooldown = SPAWN_COOLDOWN_TICKS;
+        }
+        self.entities.push(new_creep);
+        self.entity_index.insert(creep_name, self.entities.len() - 1);
+        true
+    }
+
     pub fn tick(&mut self, engine: &ScriptEngine) {
         // Уменьшаем кулдауны спавнов на 1
         for entity in &mut self.entities {
@@ -716,6 +868,22 @@ impl World {
             }
         }
 
+        // ── before_tick(game) — глобальный хук, аналог Screeps loop() ──
+        // Вызывается ОДИН раз в начале тика, ДО обработки крипов.
+        // Позволяет Lua-коду спавнить крипов даже когда их нет на карте.
+        let game_ctx = self.build_game_context();
+        if let Ok(Some(action)) = engine.call_before_tick(&game_ctx) {
+            match &action {
+                Action::Spawn { target_id, body, name } => {
+                    self.process_spawn(target_id, body, name);
+                }
+                other => {
+                    tracing::warn!(action = ?other, "before_tick returned non-spawn action, ignored");
+                }
+            }
+        }
+
+        // ── Per-creep decide() ──
         let creep_ids: Vec<String> = self
             .entities
             .iter()
@@ -1093,100 +1261,7 @@ impl World {
                 body,
                 name,
             } => {
-                // 1. Найти спавн
-                let spawn = self.get_entity(target_id).cloned();
-                if let Some(spawn) = spawn {
-                    if spawn.entity_type != EntityType::Spawn {
-                        tracing::warn!(target_id = %target_id, "spawn failed: target is not a Spawn");
-                        return;
-                    }
-                    if spawn.spawn_cooldown > 0 {
-                        tracing::debug!(
-                            target_id = %target_id,
-                            cooldown = spawn.spawn_cooldown,
-                            "spawn failed: cooldown"
-                        );
-                        return;
-                    }
-                    // 2. Парсим body parts
-                    let mut parts = Vec::new();
-                    for part_str in body {
-                        match parse_body_part(part_str) {
-                            Some(p) => parts.push(p),
-                            None => {
-                                tracing::warn!(
-                                    unknown_part = %part_str,
-                                    "spawn failed: unknown body part"
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    if parts.is_empty() {
-                        tracing::warn!("spawn failed: empty body");
-                        return;
-                    }
-                    // 3. Проверяем стоимость
-                    let cost = body_cost(&parts);
-                    if cost > spawn.energy {
-                        tracing::debug!(
-                            target_id = %target_id,
-                            cost,
-                            available = spawn.energy,
-                            "spawn failed: not enough energy"
-                        );
-                        return;
-                    }
-                    // 4. Ищем свободную клетку рядом со спавном
-                    let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-                    let mut spawn_pos = None;
-                    for &(dx, dy) in &directions {
-                        let next = Position {
-                            x: spawn.pos.x + dx,
-                            y: spawn.pos.y + dy,
-                        };
-                        if self.is_walkable(next) {
-                            spawn_pos = Some(next);
-                            break;
-                        }
-                    }
-                    let spawn_pos = match spawn_pos {
-                        Some(p) => p,
-                        None => {
-                            tracing::warn!(
-                                target_id = %target_id,
-                                "spawn failed: no adjacent walkable cell"
-                            );
-                            return;
-                        }
-                    };
-                    // 5. Генерируем ID
-                    let creep_name = if name.is_empty() {
-                        format!("worker_{}", self.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count() + 1)
-                    } else {
-                        name.clone()
-                    };
-                    // 6. Создаём крипа
-                    let new_creep = Entity::new_creep(&creep_name, spawn_pos, parts);
-                    tracing::info!(
-                        target_id = %target_id,
-                        new_id = %creep_name,
-                        cost,
-                        pos.x = spawn_pos.x,
-                        pos.y = spawn_pos.y,
-                        body = ?body,
-                        "spawned creep"
-                    );
-                    // 7. Тратим энергию и ставим кулдаун
-                    if let Some(s) = self.get_entity_mut(target_id) {
-                        s.energy -= cost;
-                        s.spawn_cooldown = SPAWN_COOLDOWN_TICKS;
-                    }
-                    self.entities.push(new_creep);
-                    self.entity_index.insert(creep_name, self.entities.len() - 1);
-                } else {
-                    tracing::warn!(target_id = %target_id, "spawn failed: spawn not found");
-                }
+                self.process_spawn(target_id, body, name);
             }
 
             Action::Idle { reason } => {
@@ -1247,10 +1322,33 @@ impl World {
         println!();
         for e in &self.entities {
             match e.entity_type {
-                EntityType::Creep => println!(
-                    "  [CREEP]  {}  pos:({},{})  hp:{}/{}  carry:[{}/{}]",
-                    e.id, e.pos.x, e.pos.y, e.hp, e.max_hp, e.carry, e.carry_capacity
-                ),
+                EntityType::Creep => {
+                    let action_str = match &e.last_action {
+                        Some(Action::Move { target, reason }) => {
+                            format!("MOVE -> ({},{}) [{}]", target.x, target.y, reason)
+                        }
+                        Some(Action::MoveTo { target, reason }) => {
+                            format!("MOVETO -> ({},{}) [{}]", target.x, target.y, reason)
+                        }
+                        Some(Action::Harvest { target_id }) => {
+                            format!("HARVEST {}", target_id)
+                        }
+                        Some(Action::Transfer { target_id, amount, .. }) => {
+                            format!("TRANSFER {} -> {}", amount, target_id)
+                        }
+                        Some(Action::Spawn { target_id, name, .. }) => {
+                            format!("SPAWN {} -> {}", target_id, name)
+                        }
+                        Some(Action::Idle { reason }) => {
+                            format!("IDLE [{}]", reason)
+                        }
+                        None => "—".to_string(),
+                    };
+                    println!(
+                        "  {}  pos:({},{})  hp:{}/{}  carry:[{}/{}]  {}",
+                        e.id, e.pos.x, e.pos.y, e.hp, e.max_hp, e.carry, e.carry_capacity, action_str
+                    );
+                }
                 EntityType::Source => println!(
                     "  [SOURCE] {}  pos:({},{})  energy: {}",
                     e.id, e.pos.x, e.pos.y, e.resource_amount
@@ -1260,35 +1358,6 @@ impl World {
                     e.id, e.pos.x, e.pos.y, e.energy
                 ),
             }
-        }
-        println!();
-        println!("  ACTIONS:");
-        let mut any_action = false;
-        for e in &self.entities {
-            if e.entity_type == EntityType::Creep {
-                if let Some(action) = &e.last_action {
-                    any_action = true;
-                    match action {
-                        Action::Move { target, reason } => {
-                            println!("    {} MOVE -> ({},{})  [{}]", e.id, target.x, target.y, reason)
-                        }
-                        Action::MoveTo { target, reason } => {
-                            println!("    {} MOVETO -> ({},{})  [{}]", e.id, target.x, target.y, reason)
-                        }
-                        Action::Harvest { target_id } => println!("    {} HARVEST from {}", e.id, target_id),
-                        Action::Transfer { target_id, resource, amount } => {
-                            println!("    {} TRANSFER {} {} -> {}", e.id, amount, resource, target_id)
-                        }
-                        Action::Idle { reason } => println!("    {} IDLE [{}]", e.id, reason),
-                        Action::Spawn { target_id, body, name } => {
-                            println!("    {} SPAWN {} body={:?} name={}", e.id, target_id, body, name)
-                        }
-                    }
-                }
-            }
-        }
-        if !any_action {
-            println!("    (none)");
         }
         println!();
         println!("  Legend: # wall | . plain | S spawn | E source | c/C creep");
@@ -1684,5 +1753,177 @@ mod tests {
         // Проверяем, что Memory.spawn_count существует
         let count = engine.get_memory_number("spawn_count");
         assert!(count.is_ok(), "Memory.spawn_count should be set");
+    }
+
+    /// Тест: process_spawn генерирует уникальное имя при дубликате
+    #[test]
+    fn test_spawn_unique_name_on_duplicate() {
+        let mut world = World::from_map(&[
+            "#####",
+            "#S.c#",
+            "#####",
+        ]);
+
+        // Пытаемся заспавнить крипа с именем worker_1 (уже существует)
+        world.apply_action(
+            "worker_1",
+            &Action::Spawn {
+                target_id: "spawn1".into(),
+                body: vec!["move".into()], // дешёвый крип (50 энергии)
+                name: "worker_1".into(),
+            },
+        );
+
+        // Крип создан, но с уникальным именем worker_1_2
+        assert_eq!(world.entities.len(), 3); // spawn + worker_1 + worker_1_2
+        assert!(world.get_entity("worker_1").is_some());
+        assert!(world.get_entity("worker_1_2").is_some());
+
+        // Ещё один дубликат → worker_1_3
+        world.entities.iter_mut()
+            .find(|e| e.entity_type == EntityType::Spawn)
+            .unwrap().spawn_cooldown = 0;
+        world.apply_action(
+            "worker_1",
+            &Action::Spawn {
+                target_id: "spawn1".into(),
+                body: vec!["move".into()],
+                name: "worker_1".into(),
+            },
+        );
+        assert!(world.get_entity("worker_1_3").is_some());
+    }
+
+    /// Тест: before_tick() вызывается и может спавнить крипов
+    #[test]
+    fn test_before_tick_spawns_creep() {
+        let engine = ScriptEngine::new().unwrap();
+
+        engine
+            .load_script_from_str(
+                r#"
+            function before_tick(game)
+                if #game.creeps < 2 then
+                    for _, sp in ipairs(game.spawns) do
+                        if sp.cooldown == 0 then
+                            return {
+                                type = "spawn",
+                                target_id = sp.id,
+                                body = {"move", "work", "carry"},
+                                name = "auto_" .. (#game.creeps + 1)
+                            }
+                        end
+                    end
+                end
+                return nil
+            end
+
+            function decide(ctx)
+                return { type = "idle", reason = "tick" }
+            end
+        "#,
+            )
+            .unwrap();
+
+        let mut world = World::from_map(&[
+            ".....",
+            ".Sc..",
+            "..E..",
+            ".....",
+            ".....",
+        ]);
+        world.view_range = 50;
+        world
+            .register_lua_functions(&engine)
+            .unwrap();
+
+        // 1 крип на карте. before_tick должен заспавнить второго.
+        assert_eq!(
+            world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(),
+            1
+        );
+
+        world.tick(&engine);
+
+        // Теперь 2 крипа
+        assert_eq!(
+            world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(),
+            2
+        );
+        assert!(world.get_entity("auto_2").is_some());
+
+        // Ещё один тик — уже 2 крипа, спавн не должен сработать (лимит 2)
+        world.tick(&engine);
+        assert_eq!(
+            world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(),
+            2
+        );
+    }
+
+    /// Тест: мир без крипов — before_tick() спавнит первого
+    #[test]
+    fn test_before_tick_bootstrap_no_creeps() {
+        let engine = ScriptEngine::new().unwrap();
+
+        engine
+            .load_script_from_str(
+                r#"
+            function before_tick(game)
+                if #game.creeps == 0 then
+                    for _, sp in ipairs(game.spawns) do
+                        if sp.cooldown == 0 then
+                            return {
+                                type = "spawn",
+                                target_id = sp.id,
+                                body = {"move", "move", "work", "carry"},
+                                name = "first_creep"
+                            }
+                        end
+                    end
+                end
+                return nil
+            end
+
+            function decide(ctx)
+                return { type = "idle", reason = "alive" }
+            end
+        "#,
+            )
+            .unwrap();
+
+        // Карта БЕЗ крипов — только спавн и источник
+        let mut world = World::from_map(&[
+            ".....",
+            ".SE..",
+            ".....",
+            ".....",
+            ".....",
+        ]);
+        world.view_range = 50;
+        world
+            .register_lua_functions(&engine)
+            .unwrap();
+
+        assert_eq!(
+            world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(),
+            0
+        );
+
+        // before_tick спавнит первого крипа
+        world.tick(&engine);
+        assert_eq!(
+            world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(),
+            1
+        );
+        assert!(world.get_entity("first_creep").is_some());
+
+        // Второй тик — decide() вызвался для первого крипа
+        world.tick(&engine);
+        assert_eq!(
+            world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(),
+            1
+        );
+        let creep = world.get_entity("first_creep").unwrap();
+        assert!(creep.last_action.is_some());
     }
 }
