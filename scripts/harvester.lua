@@ -1,39 +1,69 @@
 function decide(ctx)
-    if ctx.carry > 0 then
-        local source = ctx.nearby_sources[1]
-        local source_ok = source and source.resource_amount > 0
-
-        if ctx.carry >= ctx.carry_capacity or not source_ok then
-            if #ctx.nearby_spawns > 0 then
-                local spawn = ctx.nearby_spawns[1]
-                local d = distance(ctx.pos, spawn.pos)
-                if d <= 1 then
-                    return { type = "transfer", target_id = spawn.id, resource = "energy", amount = ctx.carry }
-                else
-                    return { type = "move", target = { x = spawn.pos.x, y = spawn.pos.y },
-                             reason = "delivering energy (" .. ctx.carry .. "/" .. ctx.carry_capacity .. ")" }
+    local function find_nearest_active_source()
+        local best = nil
+        local best_dist = math.huge
+        for _, src in ipairs(ctx.nearby_sources) do
+            if src.resource_amount > 0 then
+                local d = distance(ctx.pos, src.pos)
+                if d < best_dist then
+                    best_dist = d
+                    best = src
                 end
             end
-            return { type = "idle", reason = "carrying but no spawn" }
+        end
+        return best, best_dist
+    end
+
+    local function find_nearest_spawn()
+        local best = nil
+        local best_dist = math.huge
+        for _, sp in ipairs(ctx.nearby_spawns) do
+            local d = distance(ctx.pos, sp.pos)
+            if d < best_dist then
+                best_dist = d
+                best = sp
+            end
+        end
+        return best, best_dist
+    end
+
+    -- Несём ресурс
+    if ctx.carry > 0 then
+        local source, src_dist = find_nearest_active_source()
+        local full = ctx.carry >= ctx.carry_capacity
+        local source_gone = (source == nil)
+
+        -- Идём доставлять, если полный или нет активных источников
+        if full or source_gone then
+            local spawn, sp_dist = find_nearest_spawn()
+            if not spawn then
+                return { type = "idle", reason = "carrying but no spawn in range" }
+            end
+            if sp_dist <= 1 then
+                return { type = "transfer", target_id = spawn.id, resource = "energy", amount = ctx.carry }
+            end
+            return { type = "moveto", target = { x = spawn.pos.x, y = spawn.pos.y },
+                     reason = "delivering energy (" .. ctx.carry .. "/" .. ctx.carry_capacity .. ")" }
         end
 
-        local d = distance(ctx.pos, source.pos)
-        if d <= 1 then
+        -- Не полный и есть активный источник — продолжаем добычу
+        if src_dist <= 1 then
             return { type = "harvest", target_id = source.id }
-        else
-            return { type = "move", target = { x = source.pos.x, y = source.pos.y },
-                     reason = "back to source (" .. ctx.carry .. "/" .. ctx.carry_capacity .. ")" }
         end
+        return { type = "moveto", target = { x = source.pos.x, y = source.pos.y },
+                 reason = "back to source (" .. ctx.carry .. "/" .. ctx.carry_capacity .. ")" }
     end
 
-    if #ctx.nearby_sources > 0 then
-        local source = ctx.nearby_sources[1]
-        if source.resource_amount <= 0 then return { type = "idle", reason = "source depleted" } end
-        local d = distance(ctx.pos, source.pos)
-        if d <= 1 then return { type = "harvest", target_id = source.id } end
-        return { type = "move", target = { x = source.pos.x, y = source.pos.y },
-                 reason = "going to source (dist " .. d .. ")" }
+    -- Пустой — ищем ближайший активный источник
+    local source, src_dist = find_nearest_active_source()
+    if source then
+        if src_dist <= 1 then
+            return { type = "harvest", target_id = source.id }
+        end
+        return { type = "moveto", target = { x = source.pos.x, y = source.pos.y },
+                 reason = "going to source (dist " .. src_dist .. ")" }
     end
 
-    return { type = "idle", reason = "no sources in range" }
+    -- Все источники истощены
+    return { type = "idle", reason = "no active sources in range" }
 end

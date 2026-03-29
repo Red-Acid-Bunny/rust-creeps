@@ -71,6 +71,12 @@ fn main() {
     world.view_range = 50;
 
     let engine = ScriptEngine::new().expect("Failed to create Lua VM");
+
+    // Регистрируем Lua-функции, зависящие от состояния мира (find_path, get_tile)
+    world
+        .register_lua_functions(&engine)
+        .expect("Failed to register world Lua functions");
+
     engine
         .load_script(std::path::Path::new("scripts/harvester.lua"))
         .expect("Failed to load harvester.lua");
