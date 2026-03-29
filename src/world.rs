@@ -985,23 +985,6 @@ impl World {
                         tracing::warn!(target_id = %target_id, "harvest failed: not adjacent to source");
                         return;
                     }
-                    // Столкновение: другой крип на этой же клетке уже работает
-                    for other in &self.entities {
-                        if other.id != creep_id
-                            && other.entity_type == EntityType::Creep
-                            && other.pos == creep.pos
-                            && matches!(
-                                &other.last_action,
-                                Some(Action::Harvest { .. }) | Some(Action::Transfer { .. })
-                            )
-                        {
-                            tracing::debug!(
-                                blocked_by = %other.id,
-                                "harvest blocked: another creep working on this cell"
-                            );
-                            return;
-                        }
-                    }
                     if !creep.can_work() {
                         tracing::warn!("harvest failed: no Work body part");
                         return;
@@ -1044,23 +1027,6 @@ impl World {
             } => {
                 let creep = self.get_entity(creep_id).cloned();
                 if let Some(creep) = creep {
-                    // Столкновение: другой крип на этой же клетке уже работает
-                    for other in &self.entities {
-                        if other.id != creep_id
-                            && other.entity_type == EntityType::Creep
-                            && other.pos == creep.pos
-                            && matches!(
-                                &other.last_action,
-                                Some(Action::Harvest { .. }) | Some(Action::Transfer { .. })
-                            )
-                        {
-                            tracing::debug!(
-                                blocked_by = %other.id,
-                                "transfer blocked: another creep working on this cell"
-                            );
-                            return;
-                        }
-                    }
                     let transfer = (*amount).min(creep.carry);
                     if transfer == 0 {
                         tracing::info!("transfer skipped: nothing to carry");
