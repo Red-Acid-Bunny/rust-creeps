@@ -1,0 +1,20 @@
+[package]
+name = "rust-creeps"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# LuaJIT — скриптовый движок (vendored = собирается из исходников, ничего ставить не нужно)
+mlua = { version = "0.10", features = ["luajit52", "vendored", "serialize"] }
+
+# Terminal UI — для отрисовки в терминале
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Сериализация (сохранение/загрузка мира)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Логирование
+tracing = "0.1"
+tracing-subscriber = "0.3"
