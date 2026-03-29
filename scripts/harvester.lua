@@ -23,22 +23,27 @@ function decide(ctx)
 
     -- ── Хелперы ──────────────────────────────────
     local function find_nearest_reachable_source()
-        local best = nil
-        local best_dist = math.huge
-
+        -- Sort sources by Manhattan distance (cheap O(n) sort)
+        local candidates = {}
         for _, src in ipairs(ctx.nearby_sources) do
             if src.resource_amount > 0 then
-                local path = find_path(ctx.pos, src.pos)
-                if path then
-                    local d = #path
-                    if d < best_dist then
-                        best_dist = d
-                        best = src
-                    end
-                end
+                local d = distance(ctx.pos, src.pos)
+                candidates[#candidates + 1] = { src = src, dist = d }
             end
         end
-        return best, best_dist
+        table.sort(candidates, function(a, b) return a.dist < b.dist end)
+
+        -- Try find_path only for nearest sources, starting from closest
+        for _, entry in ipairs(candidates) do
+            if entry.dist <= 1 then
+                return entry.src, 1
+            end
+            local path = find_path(ctx.pos, entry.src.pos)
+            if path then
+                return entry.src, #path
+            end
+        end
+        return nil, nil
     end
 
     local function find_nearest_spawn()

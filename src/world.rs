@@ -1,7 +1,7 @@
 use crate::lua_api::{Action, NearbyEntity, Position, ScriptEngine, UnitContext};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 // ═══════════════════════════════════════
 //  Типы тайлов и сущностей
@@ -197,7 +197,7 @@ fn is_pos_walkable(
     pos: Position,
     width: i32,
     height: i32,
-    blockers: &[Position],
+    blockers: &HashSet<Position>,
 ) -> bool {
     if !in_bounds(pos, width, height) {
         return false;
@@ -205,10 +205,7 @@ fn is_pos_walkable(
     if tiles[pos.y as usize][pos.x as usize] == TileType::Wall {
         return false;
     }
-    if blockers.contains(&pos) {
-        return false;
-    }
-    true
+    !blockers.contains(&pos)
 }
 
 /// Ищет ближайшую проходимую клетку, смежную с pos (distance = 1).
@@ -218,7 +215,7 @@ fn find_adjacent_walkable(
     pos: Position,
     width: i32,
     height: i32,
-    blockers: &[Position],
+    blockers: &HashSet<Position>,
 ) -> Option<Position> {
     let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
     for &(dx, dy) in &directions {
@@ -243,7 +240,7 @@ pub fn astar(
     tiles: &[Vec<TileType>],
     width: i32,
     height: i32,
-    blockers: &[Position],
+    blockers: &HashSet<Position>,
     from: Position,
     to: Position,
     avoid_swamp: bool,
@@ -371,6 +368,7 @@ pub struct World {
     pub view_range: i32,
     pub harvest_rate: u32,
     pub last_action: Action,
+    blocker_set: HashSet<Position>,
 }
 
 impl World {
@@ -435,6 +433,12 @@ impl World {
             }
         }
 
+        let blocker_set: HashSet<Position> = entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Source || e.entity_type == EntityType::Spawn)
+            .map(|e| e.pos)
+            .collect();
+
         let world = World {
             width,
             height,
@@ -446,6 +450,7 @@ impl World {
             last_action: Action::Idle {
                 reason: "world created".to_string(),
             },
+            blocker_set,
         };
 
         tracing::info!(
@@ -473,7 +478,7 @@ impl World {
     }
 
     /// Собирает позиции непроходимых сущностей (sources, spawns).
-    fn block_positions(&self) -> Vec<Position> {
+    fn block_positions(&self) -> HashSet<Position> {
         self.entities
             .iter()
             .filter(|e| e.entity_type == EntityType::Source || e.entity_type == EntityType::Spawn)
@@ -489,12 +494,13 @@ impl World {
             return Some(target);
         }
         let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-        let mut visited = vec![target];
+        let mut visited: HashSet<Position> = HashSet::new();
+        visited.insert(target);
         let w = self.width as i32;
         let h = self.height as i32;
         for _ in 1..=max_dist {
-            let mut frontier = Vec::new();
-            for pos in &visited {
+            let mut frontier: Vec<Position> = Vec::new();
+            for &pos in &visited {
                 for &(dx, dy) in &directions {
                     let next = Position { x: pos.x + dx, y: pos.y + dy };
                     if next.x >= 0 && next.y >= 0 && next.x < w && next.y < h {
@@ -507,9 +513,11 @@ impl World {
                     }
                 }
             }
-            visited.extend(frontier);
+            for pos in frontier {
+                visited.insert(pos);
+            }
             if visited.len() > (max_dist as usize * max_dist as usize * 4) {
-                break; // safety limit
+                break;
             }
         }
         None
@@ -642,14 +650,7 @@ impl World {
         if self.tiles[pos.y as usize][pos.x as usize] == TileType::Wall {
             return false;
         }
-        for e in &self.entities {
-            if e.pos.x == pos.x && e.pos.y == pos.y {
-                if e.entity_type == EntityType::Source || e.entity_type == EntityType::Spawn {
-                    return false;
-                }
-            }
-        }
-        true
+        !self.blocker_set.contains(&pos)
     }
 
     pub fn step_toward(&self, from: Position, to: Position) -> Option<Position> {
@@ -1305,8 +1306,9 @@ mod tests {
             vec![TileType::Plain, TileType::Wall, TileType::Plain],
             vec![TileType::Plain, TileType::Plain, TileType::Plain],
         ];
+        let blockers: HashSet<Position> = HashSet::new();
         let path = astar(
-            &tiles, 3, 3, &[],
+            &tiles, 3, 3, &blockers,
             Position { x: 0, y: 0 },
             Position { x: 2, y: 2 },
             false,
@@ -1330,8 +1332,9 @@ mod tests {
             vec![TileType::Plain, TileType::Plain, TileType::Plain],
         ];
         // Swamp разрешён: кратчайший путь через него
+        let blockers: HashSet<Position> = HashSet::new();
         let path = astar(
-            &tiles, 3, 2, &[],
+            &tiles, 3, 2, &blockers,
             Position { x: 0, y: 0 },
             Position { x: 2, y: 0 },
             false,
@@ -1348,8 +1351,9 @@ mod tests {
             vec![TileType::Plain, TileType::Plain, TileType::Plain],
         ];
         // Swamp запрещён: путь в обход
+        let blockers: HashSet<Position> = HashSet::new();
         let path = astar(
-            &tiles, 3, 2, &[],
+            &tiles, 3, 2, &blockers,
             Position { x: 0, y: 0 },
             Position { x: 2, y: 0 },
             true,
@@ -1371,8 +1375,9 @@ mod tests {
             vec![TileType::Wall, TileType::Wall, TileType::Wall],
             vec![TileType::Plain, TileType::Wall, TileType::Plain],
         ];
+        let blockers: HashSet<Position> = HashSet::new();
         let path = astar(
-            &tiles, 3, 3, &[],
+            &tiles, 3, 3, &blockers,
             Position { x: 0, y: 0 },
             Position { x: 2, y: 2 },
             false,
@@ -1383,8 +1388,9 @@ mod tests {
     #[test]
     fn test_astar_same_position() {
         let tiles = vec![vec![TileType::Plain]];
+        let blockers: HashSet<Position> = HashSet::new();
         let path = astar(
-            &tiles, 1, 1, &[],
+            &tiles, 1, 1, &blockers,
             Position { x: 0, y: 0 },
             Position { x: 0, y: 0 },
             false,
@@ -1399,9 +1405,10 @@ mod tests {
             vec![TileType::Plain, TileType::Plain, TileType::Plain],
         ];
         let blocker = Position { x: 1, y: 0 };
+        let blockers: HashSet<Position> = [blocker].iter().copied().collect();
         // Цель — на блокере, путь должен существовать (целевая клетка разрешена)
         let path = astar(
-            &tiles, 3, 2, &[blocker],
+            &tiles, 3, 2, &blockers,
             Position { x: 0, y: 0 },
             Position { x: 1, y: 0 },
             false,
@@ -1410,7 +1417,7 @@ mod tests {
 
         // Пройти через блокер нельзя
         let path = astar(
-            &tiles, 3, 2, &[blocker],
+            &tiles, 3, 2, &blockers,
             Position { x: 0, y: 0 },
             Position { x: 2, y: 0 },
             false,
