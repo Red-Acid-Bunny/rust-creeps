@@ -62,6 +62,15 @@ impl UnitContext {
     }
 }
 
+/// Форматирует Lua-число (Integer или Number) в строку.
+fn fmt_num(val: &mlua::Value) -> String {
+    match val {
+        mlua::Value::Integer(n) => n.to_string(),
+        mlua::Value::Number(n) => format!("{:.0}", n),
+        _ => "?".to_string(),
+    }
+}
+
 pub struct ScriptEngine {
     lua: Lua,
 }
@@ -78,7 +87,13 @@ impl ScriptEngine {
             setmetatable(_G, _mt)
         "#)
         .exec()?;
-        tracing::info!("Lua VM created");
+
+        // Memory — глобальная персистентная таблица (как в Screeps).
+        // Доступна всем крипам во всех тиках. Выживает при перезагрузке скрипта
+        // (т.к. load_script не очищает глобалы).
+        let memory = lua.create_table()?;
+        lua.globals().set("Memory", memory)?;
+        tracing::info!("Lua VM created, Memory initialized");
         Ok(Self { lua })
     }
 
@@ -118,6 +133,87 @@ impl ScriptEngine {
         F: FnOnce(&Lua) -> LuaResult<R>,
     {
         f(&self.lua)
+    }
+
+    /// Читает число из Memory[key]. Для тестов.
+    /// Возвращает None если Memory[key] не существует или не число.
+    pub fn get_memory_number(&self, key: &str) -> LuaResult<Option<f64>> {
+        self.with_lua(|lua| {
+            let memory: mlua::Table = lua.globals().get("Memory")?;
+            let val: mlua::Value = memory.get(key)?;
+            match val {
+                mlua::Value::Integer(n) => Ok(Some(n as f64)),
+                mlua::Value::Number(n) => Ok(Some(n)),
+                _ => Ok(None),
+            }
+        })
+    }
+
+    /// Читает строку из Memory[key]. Для тестов.
+    pub fn get_memory_string(&self, key: &str) -> LuaResult<Option<String>> {
+        self.with_lua(|lua| {
+            let memory: mlua::Table = lua.globals().get("Memory")?;
+            let val: Value = memory.get(key)?;
+            match val {
+                Value::String(s) => Ok(Some(s.to_string_lossy().to_string())),
+                _ => Ok(None),
+            }
+        })
+    }
+
+    /// Возвращает форматированную строку с содержимым Memory для отображения в UI.
+    pub fn format_memory(&self) -> LuaResult<String> {
+        self.with_lua(|lua| {
+            let memory: mlua::Table = lua.globals().get("Memory")?;
+            let mut lines = Vec::new();
+
+            // spawn_count
+            let count: mlua::Value = memory.get("spawn_count")?;
+            if let mlua::Value::Integer(n) = count {
+                lines.push(format!("  spawn_count: {}", n));
+            }
+
+            // creeps
+            let creeps: mlua::Value = memory.get("creeps")?;
+            if let mlua::Value::Table(t) = creeps {
+                let mut entries: Vec<(String, String)> = Vec::new();
+                for pair in t.pairs::<mlua::Value, mlua::Table>() {
+                    if let Ok((mlua::Value::String(id), info)) = pair {
+                        let tick: mlua::Value = info.get("tick")?;
+                        let carry: mlua::Value = info.get("carry")?;
+                        let pos: mlua::Value = info.get("pos")?;
+                        let pos_str = if let mlua::Value::Table(p) = pos {
+                            let x: mlua::Value = p.get("x")?;
+                            let y: mlua::Value = p.get("y")?;
+                            format!("({},{})", fmt_num(&x), fmt_num(&y))
+                        } else {
+                            "?".to_string()
+                        };
+                        entries.push((
+                            id.to_string_lossy().to_string(),
+                            format!(
+                                "tick:{} carry:{} pos:{}",
+                                fmt_num(&tick),
+                                fmt_num(&carry),
+                                pos_str
+                            ),
+                        ));
+                    }
+                }
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                if !entries.is_empty() {
+                    lines.push(format!("  creeps ({}):", entries.len()));
+                    for (id, info) in &entries {
+                        lines.push(format!("    {}  {}", id, info));
+                    }
+                }
+            }
+
+            if lines.is_empty() {
+                lines.push("  (empty)".to_string());
+            }
+            Ok(lines.join("\n"))
+        })
     }
 
     fn context_to_lua(&self, ctx: &UnitContext) -> LuaResult<Table> {
@@ -279,5 +375,97 @@ mod tests {
             action,
             Action::MoveTo { target, reason } if target.x == 5 && target.y == 5 && reason == "going there"
         ));
+    }
+
+    #[test]
+    fn test_memory_persists_between_calls() {
+        let engine = ScriptEngine::new().unwrap();
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                Memory.counter = (Memory.counter or 0) + 1
+                return { type = "idle", reason = "count=" .. Memory.counter }
+            end
+        "#,
+            )
+            .unwrap();
+        let ctx = UnitContext::empty("c1", Position { x: 0, y: 0 });
+
+        // Первый вызов
+        let a1 = engine.call_decide(&ctx).unwrap();
+        assert!(matches!(a1, Action::Idle { ref reason } if reason == "count=1"));
+
+        // Второй вызов — Memory.counter должен быть 2
+        let a2 = engine.call_decide(&ctx).unwrap();
+        assert!(matches!(a2, Action::Idle { ref reason } if reason == "count=2"));
+
+        // Третий вызов
+        let a3 = engine.call_decide(&ctx).unwrap();
+        assert!(matches!(a3, Action::Idle { ref reason } if reason == "count=3"));
+    }
+
+    #[test]
+    fn test_memory_shared_across_creeps() {
+        let engine = ScriptEngine::new().unwrap();
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                Memory.creeps = Memory.creeps or {}
+                Memory.creeps[ctx.id] = ctx.tick
+                local n = 0
+                for _ in pairs(Memory.creeps) do n = n + 1 end
+                return { type = "idle", reason = "known=" .. n }
+            end
+        "#,
+            )
+            .unwrap();
+
+        // Имитация двух крипов
+        let ctx1 = UnitContext::empty("worker_1", Position { x: 0, y: 0 });
+        let ctx2 = UnitContext::empty("worker_2", Position { x: 1, y: 0 });
+
+        let a1 = engine.call_decide(&ctx1).unwrap();
+        assert!(matches!(a1, Action::Idle { ref reason } if reason == "known=1"));
+
+        // worker_2 видит Memory.creeps с worker_1
+        let a2 = engine.call_decide(&ctx2).unwrap();
+        assert!(matches!(a2, Action::Idle { ref reason } if reason == "known=2"));
+    }
+
+    #[test]
+    fn test_memory_survives_script_reload() {
+        let engine = ScriptEngine::new().unwrap();
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                Memory.data = (Memory.data or 0) + 1
+                return { type = "idle", reason = "data=" .. Memory.data }
+            end
+        "#,
+            )
+            .unwrap();
+
+        let ctx = UnitContext::empty("c1", Position { x: 0, y: 0 });
+        engine.call_decide(&ctx).unwrap(); // data=1
+        engine.call_decide(&ctx).unwrap(); // data=2
+
+        // Перезагрузка скрипта
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                Memory.data = (Memory.data or 0) + 10
+                return { type = "idle", reason = "data=" .. Memory.data }
+            end
+        "#,
+            )
+            .unwrap();
+
+        // Memory.data должно быть 12 (2 + 10), а не 10
+        let a = engine.call_decide(&ctx).unwrap();
+        assert!(matches!(a, Action::Idle { ref reason } if reason == "data=12"));
     }
 }

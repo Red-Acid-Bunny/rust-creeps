@@ -2,6 +2,25 @@ function decide(ctx)
     -- Стоимость body parts (должна совпадать с Rust)
     local BODY_COST = { move = 50, work = 100, carry = 50, attack = 80, tough = 10 }
 
+    -- ── Memory ────────────────────────────────────
+    -- Инициализация при первом вызове
+    if not Memory.creeps then Memory.creeps = {} end
+    if not Memory.spawn_count then Memory.spawn_count = 0 end
+
+    -- Обновляем: помечаем себя живым
+    Memory.creeps[ctx.id] = {
+        tick = ctx.tick,
+        pos = { x = ctx.pos.x, y = ctx.pos.y },
+        carry = ctx.carry,
+    }
+
+    -- Считаем количество живых крипов
+    local function count_creeps()
+        local n = 0
+        for _ in pairs(Memory.creeps) do n = n + 1 end
+        return n
+    end
+
     -- ── Хелперы ──────────────────────────────────
     local function find_nearest_reachable_source()
         local best = nil
@@ -35,10 +54,6 @@ function decide(ctx)
         return best, best_dist
     end
 
-    local function count_creeps()
-        return #ctx.nearby_creeps + 1  -- +1 = сам крип
-    end
-
     -- ── Спавн ────────────────────────────────────
     -- Спавним нового крипа, если:
     --   1. Есть доступный спавн
@@ -69,11 +84,13 @@ function decide(ctx)
             return nil
         end
 
+        Memory.spawn_count = Memory.spawn_count + 1
+
         return {
             type = "spawn",
             target_id = spawn.id,
             body = body,
-            name = "worker_" .. (count_creeps() + 1)
+            name = "worker_" .. Memory.spawn_count
         }
     end
 
