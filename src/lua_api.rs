@@ -2,6 +2,17 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Контекст глобального хука before_tick(game).
+/// Передаётся один раз в начале каждого тика, ДО обработки крипов.
+/// Позволяет Lua-коду управлять спавном и другой глобальной логикой.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameContext {
+    pub tick: u64,
+    pub creeps: Vec<NearbyEntity>,
+    pub spawns: Vec<NearbyEntity>,
+    pub sources: Vec<NearbyEntity>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     Move { target: Position, reason: String },
@@ -62,12 +73,43 @@ impl UnitContext {
     }
 }
 
-/// Форматирует Lua-число (Integer или Number) в строку.
-fn fmt_num(val: &mlua::Value) -> String {
-    match val {
+/// Рекурсивно форматирует Lua-значение в компактную строку.
+/// depth — глубина рекурсии (лимит 2 уровня для компактности).
+fn format_lua_value(value: &mlua::Value, depth: usize) -> String {
+    if depth > 2 {
+        return "{...}".to_string();
+    }
+    match value {
+        mlua::Value::Nil => "nil".to_string(),
+        mlua::Value::Boolean(b) => b.to_string(),
         mlua::Value::Integer(n) => n.to_string(),
         mlua::Value::Number(n) => format!("{:.0}", n),
-        _ => "?".to_string(),
+        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+        mlua::Value::Table(t) => {
+            let mut parts: Vec<String> = Vec::new();
+            for pair in t.pairs::<mlua::Value, mlua::Value>() {
+                if let Ok((k, v)) = pair {
+                    let key_str = match &k {
+                        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+                        mlua::Value::Integer(i) => i.to_string(),
+                        mlua::Value::Number(n) => format!("{:.0}", n),
+                        _ => "?".to_string(),
+                    };
+                    let val_str = format_lua_value(&v, depth + 1);
+                    parts.push(format!("{}={}", key_str, val_str));
+                }
+            }
+            if parts.is_empty() {
+                "{}".to_string()
+            } else {
+                format!("{{{}}}", parts.join(", "))
+            }
+        }
+        mlua::Value::Function(_) => "[function]".to_string(),
+        mlua::Value::UserData(_) | mlua::Value::LightUserData(_) => "[userdata]".to_string(),
+        mlua::Value::Thread(_) => "[thread]".to_string(),
+        mlua::Value::Error(e) => format!("[error: {}]", e),
+        _ => "[?]".to_string(),
     }
 }
 
@@ -183,6 +225,83 @@ impl ScriptEngine {
         self.parse_action(result)
     }
 
+    /// Вызывает Lua-функцию before_tick(game), если она определена.
+    /// Возвращает Some(action) если функция вернула экшен, иначе None.
+    /// Если функция не определена — возвращает None (не ошибка).
+    pub fn call_before_tick(&self, game: &GameContext) -> LuaResult<Option<Action>> {
+        self.with_lua(|lua| {
+            let val: mlua::Value = lua.globals().get("before_tick")?;
+            match val {
+                mlua::Value::Function(func) => {
+                    let game_table = lua.create_table()?;
+                    game_table.set("tick", game.tick)?;
+                    game_table.set("creeps", Self::vec_nearby_to_lua_static(&lua, &game.creeps)?)?;
+                    game_table.set("spawns", Self::vec_nearby_to_lua_static(&lua, &game.spawns)?)?;
+                    game_table.set("sources", Self::vec_nearby_to_lua_static(&lua, &game.sources)?)?;
+                    let result: Table = func.call(game_table)?;
+                    Ok(Some(Self::parse_action_static(&lua, result)?))
+                }
+                _ => Ok(None),
+            }
+        })
+    }
+
+    /// Статическая версия vec_nearby_to_lua (для call_before_tick где нет &self).
+    fn vec_nearby_to_lua_static(lua: &Lua, entities: &[NearbyEntity]) -> LuaResult<Table> {
+        let table = lua.create_table()?;
+        for (i, entity) in entities.iter().enumerate() {
+            let pos = lua.create_table()?;
+            pos.set("x", entity.pos.x)?;
+            pos.set("y", entity.pos.y)?;
+            let row = lua.create_table()?;
+            row.set("id", entity.id.clone())?;
+            row.set("pos", pos)?;
+            row.set("resource_amount", entity.resource_amount)?;
+            row.set("cooldown", entity.cooldown)?;
+            table.set(i + 1, row)?;
+        }
+        Ok(table)
+    }
+
+    /// Статическая версия parse_action (для call_before_tick где нет &self).
+    fn parse_action_static(_lua: &Lua, table: Table) -> LuaResult<Action> {
+        let action_type: String = table
+            .get("type")
+            .map_err(|_| mlua::Error::external("Action missing 'type'"))?;
+        match action_type.as_str() {
+            "move" => {
+                let target: Table = table.get("target")?;
+                Ok(Action::Move {
+                    target: Position { x: target.get("x")?, y: target.get("y")? },
+                    reason: table.get("reason").unwrap_or_default(),
+                })
+            }
+            "moveto" => {
+                let target: Table = table.get("target")?;
+                Ok(Action::MoveTo {
+                    target: Position { x: target.get("x")?, y: target.get("y")? },
+                    reason: table.get("reason").unwrap_or_default(),
+                })
+            }
+            "harvest" => Ok(Action::Harvest { target_id: table.get("target_id")? }),
+            "transfer" => Ok(Action::Transfer {
+                target_id: table.get("target_id")?,
+                resource: table.get("resource")?,
+                amount: table.get("amount")?,
+            }),
+            "spawn" => {
+                let body: Vec<String> = table.get("body")?;
+                Ok(Action::Spawn {
+                    target_id: table.get("target_id")?,
+                    body,
+                    name: table.get("name").unwrap_or_default(),
+                })
+            }
+            "idle" => Ok(Action::Idle { reason: table.get("reason").unwrap_or_default() }),
+            other => Err(mlua::Error::external(format!("Unknown action: '{}'", other))),
+        }
+    }
+
     pub fn global_is_nil(&self, name: &str) -> LuaResult<bool> {
         let val: Value = self.lua.globals().get(name)?;
         Ok(matches!(val, Value::Nil))
@@ -224,57 +343,28 @@ impl ScriptEngine {
     }
 
     /// Возвращает форматированную строку с содержимым Memory для отображения в UI.
+    /// Работает с любой структурой Memory — не привязан к конкретной схеме.
     pub fn format_memory(&self) -> LuaResult<String> {
         self.with_lua(|lua| {
             let memory: mlua::Table = lua.globals().get("Memory")?;
             let mut lines = Vec::new();
-
-            // spawn_count
-            let count: mlua::Value = memory.get("spawn_count")?;
-            if let mlua::Value::Integer(n) = count {
-                lines.push(format!("  spawn_count: {}", n));
-            }
-
-            // creeps
-            let creeps: mlua::Value = memory.get("creeps")?;
-            if let mlua::Value::Table(t) = creeps {
-                let mut entries: Vec<(String, String)> = Vec::new();
-                for pair in t.pairs::<mlua::Value, mlua::Table>() {
-                    if let Ok((mlua::Value::String(id), info)) = pair {
-                        let tick: mlua::Value = info.get("tick")?;
-                        let carry: mlua::Value = info.get("carry")?;
-                        let pos: mlua::Value = info.get("pos")?;
-                        let pos_str = if let mlua::Value::Table(p) = pos {
-                            let x: mlua::Value = p.get("x")?;
-                            let y: mlua::Value = p.get("y")?;
-                            format!("({},{})", fmt_num(&x), fmt_num(&y))
-                        } else {
-                            "?".to_string()
-                        };
-                        entries.push((
-                            id.to_string_lossy().to_string(),
-                            format!(
-                                "tick:{} carry:{} pos:{}",
-                                fmt_num(&tick),
-                                fmt_num(&carry),
-                                pos_str
-                            ),
-                        ));
-                    }
-                }
-                entries.sort_by(|a, b| a.0.cmp(&b.0));
-                if !entries.is_empty() {
-                    lines.push(format!("  creeps ({}):", entries.len()));
-                    for (id, info) in &entries {
-                        lines.push(format!("    {}  {}", id, info));
-                    }
+            for pair in memory.pairs::<mlua::Value, mlua::Value>() {
+                if let Ok((k, v)) = pair {
+                    let key_str = match &k {
+                        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+                        mlua::Value::Integer(i) => i.to_string(),
+                        mlua::Value::Number(n) => format!("{:.0}", n),
+                        _ => continue,
+                    };
+                    let val_str = format_lua_value(&v, 1);
+                    lines.push(format!("  {} = {}", key_str, val_str));
                 }
             }
-
             if lines.is_empty() {
-                lines.push("  (empty)".to_string());
+                Ok("  (empty)".to_string())
+            } else {
+                Ok(lines.join("\n"))
             }
-            Ok(lines.join("\n"))
         })
     }
 
