@@ -1,368 +1,14 @@
-use crate::lua_api::{Action, GameContext, NearbyEntity, Position, ScriptEngine, UnitContext};
-use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+
+use crate::game::pathfinding;
+use crate::game::types::*;
+use crate::script::ScriptEngine;
 
 // ═══════════════════════════════════════
-//  Типы тайлов и сущностей
+//  GameState — игровой мир
 // ═══════════════════════════════════════
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum TileType {
-    Plain,
-    Wall,
-    Swamp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum EntityType {
-    Creep,
-    Source,
-    Spawn,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum BodyPart {
-    Move,
-    Work,
-    Carry,
-    Attack,
-    Tough,
-}
-
-/// Стоимость движения на болоте в очках скорости.
-/// Plain = 1 очко, Swamp = SWAMP_COST очков.
-pub const SWAMP_COST: u32 = 2;
-
-/// Кулдаун спавна в тиках после создания крипа.
-pub const SPAWN_COOLDOWN_TICKS: u32 = 3;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entity {
-    pub id: String,
-    pub entity_type: EntityType,
-    pub pos: Position,
-    pub hp: u32,
-    pub max_hp: u32,
-    pub energy: u32,
-    pub carry: u32,
-    pub carry_capacity: u32,
-    pub body: Vec<BodyPart>,
-    pub resource_amount: u32,
-    /// Запланированный маршрут (используется MoveTo).
-    /// Путь включает все позиции от старта до цели.
-    #[serde(default)]
-    pub planned_path: Vec<Position>,
-    /// Последнее действие крипа (используется для проверки столкновений).
-    /// Source и Spawn не используют это поле.
-    #[serde(default)]
-    pub last_action: Option<Action>,
-    /// Кулдаун спавна: оставшиеся тики до следующего создания крипа.
-    /// Только для EntityType::Spawn.
-    #[serde(default)]
-    pub spawn_cooldown: u32,
-}
-
-impl Entity {
-    pub fn new_source(id: &str, pos: Position, amount: u32) -> Self {
-        Entity {
-            id: id.to_string(),
-            entity_type: EntityType::Source,
-            pos,
-            hp: 0,
-            max_hp: 0,
-            energy: 0,
-            carry: 0,
-            carry_capacity: 0,
-            body: vec![],
-            resource_amount: amount,
-            planned_path: vec![],
-            last_action: None,
-            spawn_cooldown: 0,
-        }
-    }
-
-    pub fn new_spawn(id: &str, pos: Position, initial_energy: u32) -> Self {
-        Entity {
-            id: id.to_string(),
-            entity_type: EntityType::Spawn,
-            pos,
-            hp: 5000,
-            max_hp: 5000,
-            energy: initial_energy,
-            carry: 0,
-            carry_capacity: 1000,
-            body: vec![],
-            resource_amount: 0,
-            planned_path: vec![],
-            last_action: None,
-            spawn_cooldown: 0,
-        }
-    }
-
-    pub fn new_creep(id: &str, pos: Position, body: Vec<BodyPart>) -> Self {
-        let mut hp = 100u32;
-        let mut carry_capacity = 0u32;
-        for part in &body {
-            match part {
-                BodyPart::Tough => hp += 100,
-                BodyPart::Carry => carry_capacity += 50,
-                _ => {}
-            }
-        }
-        Entity {
-            id: id.to_string(),
-            entity_type: EntityType::Creep,
-            pos,
-            hp,
-            max_hp: hp,
-            energy: 0,
-            carry: 0,
-            carry_capacity,
-            body,
-            resource_amount: 0,
-            planned_path: vec![],
-            last_action: None,
-            spawn_cooldown: 0,
-        }
-    }
-
-    /// Скорость движения: сколько клеток за тик.
-    /// Сейчас: количество частей Move.
-    /// Будущее: система веса, buff'ы/дебаффы — менять только здесь.
-    pub fn move_speed(&self) -> u32 {
-        self.body.iter().filter(|p| **p == BodyPart::Move).count() as u32
-    }
-
-    pub fn can_move(&self) -> bool {
-        self.move_speed() > 0
-    }
-
-    pub fn can_work(&self) -> bool {
-        self.body.contains(&BodyPart::Work)
-    }
-
-    pub fn has_capacity(&self) -> bool {
-        self.carry < self.carry_capacity
-    }
-}
-
-/// Стоимость создания одной body part (в единицах энергии).
-pub fn body_part_cost(part: &BodyPart) -> u32 {
-    match part {
-        BodyPart::Move => 50,
-        BodyPart::Work => 100,
-        BodyPart::Carry => 50,
-        BodyPart::Attack => 80,
-        BodyPart::Tough => 10,
-    }
-}
-
-/// Парсит строку Lua в BodyPart. Возвращает None если имя неизвестно.
-pub fn parse_body_part(s: &str) -> Option<BodyPart> {
-    match s.to_lowercase().as_str() {
-        "move" => Some(BodyPart::Move),
-        "work" => Some(BodyPart::Work),
-        "carry" => Some(BodyPart::Carry),
-        "attack" => Some(BodyPart::Attack),
-        "tough" => Some(BodyPart::Tough),
-        _ => None,
-    }
-}
-
-/// Считает общую стоимость набора body parts.
-pub fn body_cost(parts: &[BodyPart]) -> u32 {
-    parts.iter().map(body_part_cost).sum()
-}
-
-// ═══════════════════════════════════════
-//  Pathfinding — A*
-// ═══════════════════════════════════════
-
-fn in_bounds(pos: Position, width: i32, height: i32) -> bool {
-    pos.x >= 0 && pos.y >= 0 && pos.x < width && pos.y < height
-}
-
-fn tile_move_cost(tile: TileType) -> u32 {
-    match tile {
-        TileType::Plain => 1,
-        TileType::Swamp => SWAMP_COST,
-        TileType::Wall => u32::MAX, // непроходимо
-    }
-}
-
-/// Проверяет, проходима ли позиция (учитывает тайлы и блокеры).
-fn is_pos_walkable(
-    tiles: &[Vec<TileType>],
-    pos: Position,
-    width: i32,
-    height: i32,
-    blockers: &[Position],
-) -> bool {
-    if !in_bounds(pos, width, height) {
-        return false;
-    }
-    if tiles[pos.y as usize][pos.x as usize] == TileType::Wall {
-        return false;
-    }
-    if blockers.contains(&pos) {
-        return false;
-    }
-    true
-}
-
-/// Ищет ближайшую проходимую клетку, смежную с pos (distance = 1).
-/// Возвращает None если все 4 соседа непроходимы.
-fn find_adjacent_walkable(
-    tiles: &[Vec<TileType>],
-    pos: Position,
-    width: i32,
-    height: i32,
-    blockers: &[Position],
-) -> Option<Position> {
-    let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-    for &(dx, dy) in &directions {
-        let next = Position {
-            x: pos.x + dx,
-            y: pos.y + dy,
-        };
-        if is_pos_walkable(tiles, next, width, height, blockers) {
-            return Some(next);
-        }
-    }
-    None
-}
-
-/// A* поиск пути. Возвращает полный путь (включая from и to) или None.
-///
-/// - `avoid_swamp = true` → swamp treated as walls (no swamp in path)
-/// - `avoid_swamp = false` → swamp allowed, costs SWAMP_MOVE_COST movement points
-///
-/// `blockers` — позиции непроходимых сущностей (sources, spawns).
-pub fn astar(
-    tiles: &[Vec<TileType>],
-    width: i32,
-    height: i32,
-    blockers: &[Position],
-    from: Position,
-    to: Position,
-    avoid_swamp: bool,
-) -> Option<Vec<Position>> {
-    if from == to {
-        return Some(vec![from]);
-    }
-
-    if !in_bounds(from, width, height) || !in_bounds(to, width, height) {
-        return None;
-    }
-
-    let is_blocked = |pos: Position| -> bool {
-        if tiles[pos.y as usize][pos.x as usize] == TileType::Wall {
-            return true;
-        }
-        if avoid_swamp && tiles[pos.y as usize][pos.x as usize] == TileType::Swamp {
-            return true;
-        }
-        if blockers.contains(&pos) && pos != to {
-            return true;
-        }
-        false
-    };
-
-    if is_blocked(from) || is_blocked(to) {
-        return None;
-    }
-
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    struct Node {
-        pos: Position,
-        g: u32,
-        f: u32,
-    }
-
-    impl Ord for Node {
-        fn cmp(&self, other: &Self) -> Ordering {
-            other.f.cmp(&self.f) // min-heap
-        }
-    }
-    impl PartialOrd for Node {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    let heuristic = |a: Position, b: Position| -> u32 {
-        (a.x - b.x).unsigned_abs() + (a.y - b.y).unsigned_abs()
-    };
-
-    let mut open = BinaryHeap::new();
-    let mut g_score: HashMap<Position, u32> = HashMap::new();
-    let mut came_from: HashMap<Position, Position> = HashMap::new();
-
-    g_score.insert(from, 0);
-    open.push(Node {
-        pos: from,
-        g: 0,
-        f: heuristic(from, to),
-    });
-
-    let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-
-    while let Some(current) = open.pop() {
-        if current.pos == to {
-            // Восстановление пути
-            let mut path = Vec::new();
-            let mut p = to;
-            while p != from {
-                path.push(p);
-                p = came_from[&p];
-            }
-            path.push(from);
-            path.reverse();
-            return Some(path);
-        }
-
-        // Пропускаем устаревшие записи
-        if current.g > *g_score.get(&current.pos).unwrap_or(&u32::MAX) {
-            continue;
-        }
-
-        for (dx, dy) in directions {
-            let next = Position {
-                x: current.pos.x + dx,
-                y: current.pos.y + dy,
-            };
-
-            if !in_bounds(next, width, height) {
-                continue;
-            }
-            if is_blocked(next) {
-                continue;
-            }
-
-            let cost = tile_move_cost(tiles[next.y as usize][next.x as usize]);
-            let tentative_g = current.g.saturating_add(cost);
-
-            if tentative_g < *g_score.get(&next).unwrap_or(&u32::MAX) {
-                g_score.insert(next, tentative_g);
-                came_from.insert(next, current.pos);
-                open.push(Node {
-                    pos: next,
-                    g: tentative_g,
-                    f: tentative_g + heuristic(next, to),
-                });
-            }
-        }
-    }
-
-    None
-}
-
-// ═══════════════════════════════════════
-//  World — игровой мир
-// ═══════════════════════════════════════
-
-pub struct World {
+pub struct GameState {
     pub width: usize,
     pub height: usize,
     pub tiles: Vec<Vec<TileType>>,
@@ -375,7 +21,7 @@ pub struct World {
     pub max_source_amount: u32,
 }
 
-impl World {
+impl GameState {
     /// Создаёт мир из строкового описания карты
     /// '#' стена  '~' болото  '.' пусто  'S' спавн  'E' источник  'c' крип
     pub fn from_map(map_strings: &[&str]) -> Self {
@@ -443,7 +89,7 @@ impl World {
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
 
-        let world = World {
+        let world = GameState {
             width,
             height,
             tiles,
@@ -481,7 +127,7 @@ impl World {
     }
 
     /// Собирает позиции непроходимых сущностей (sources, spawns).
-    fn block_positions(&self) -> Vec<Position> {
+    pub fn block_positions(&self) -> Vec<Position> {
         self.entities
             .iter()
             .filter(|e| e.entity_type == EntityType::Source || e.entity_type == EntityType::Spawn)
@@ -527,7 +173,7 @@ impl World {
     }
 
     /// Регистрирует глобальные Lua-функции, зависящие от состояния мира.
-    /// Вызывать один раз после создания World и ScriptEngine.
+    /// Вызывать один раз после создания GameState и ScriptEngine.
     pub fn register_lua_functions(&self, engine: &ScriptEngine) -> mlua::Result<()> {
         let tiles = self.tiles.clone();
         let width = self.width as i32;
@@ -565,10 +211,10 @@ impl World {
                     // find_path: если цель непроходима, автоматически перенаправляет
                     // на ближайшую проходимую клетку. Если цели нельзя достичь
                     // для взаимодействия (нет walkable клетки на dist 1), возвращает nil.
-                    let effective_to = if is_pos_walkable(&tiles_fp, to_pos, w, h, &bl) {
+                    let effective_to = if pathfinding::is_pos_walkable(&tiles_fp, to_pos, w, h, &bl) {
                         to_pos
                     } else {
-                        match find_adjacent_walkable(&tiles_fp, to_pos, w, h, &bl) {
+                        match pathfinding::find_adjacent_walkable(&tiles_fp, to_pos, w, h, &bl) {
                             Some(p) => p,
                             None => {
                                 // Цель полностью окружена — недоступна
@@ -577,7 +223,7 @@ impl World {
                         }
                     };
 
-                    match astar(&tiles_fp, w, h, &bl, from_pos, effective_to, avoid_swamp) {
+                    match pathfinding::astar(&tiles_fp, w, h, &bl, from_pos, effective_to, avoid_swamp) {
                         Some(positions) => {
                             let table = lua.create_table()?;
                             for (i, pos) in positions.iter().enumerate() {
@@ -704,7 +350,7 @@ impl World {
     }
 
     /// Собирает GameContext для передачи в before_tick().
-    fn build_game_context(&self) -> GameContext {
+    pub fn build_game_context(&self) -> GameContext {
         let creeps: Vec<NearbyEntity> = self
             .entities
             .iter()
@@ -968,7 +614,7 @@ impl World {
         }
     }
 
-    fn apply_action(&mut self, creep_id: &str, action: &Action) {
+    pub fn apply_action(&mut self, creep_id: &str, action: &Action) {
         // Записываем last_action на сущность (для проверки столкновений)
         if let Some(c) = self.get_entity_mut(creep_id) {
             c.last_action = Some(action.clone());
@@ -1001,7 +647,7 @@ impl World {
                         }
                         if let Some(next_pos) = self.step_toward(pos, *target) {
                             let next_tile = self.tiles[next_pos.y as usize][next_pos.x as usize];
-                            let step_cost = tile_move_cost(next_tile);
+                            let step_cost = pathfinding::tile_move_cost(next_tile);
 
                             if move_points < step_cost {
                                 break;
@@ -1065,7 +711,7 @@ impl World {
 
                     let path = if needs_recompute {
                         let blockers = self.block_positions();
-                        match astar(
+                        match pathfinding::astar(
                             &self.tiles,
                             self.width as i32,
                             self.height as i32,
@@ -1119,7 +765,7 @@ impl World {
                         }
 
                         let next_tile = self.tiles[path[i].y as usize][path[i].x as usize];
-                        let step_cost = tile_move_cost(next_tile);
+                        let step_cost = pathfinding::tile_move_cost(next_tile);
 
                         if move_points < step_cost {
                             break;
@@ -1269,136 +915,6 @@ impl World {
             }
         }
     }
-
-    pub fn render(&self, engine: &ScriptEngine) {
-        print!("\x1B[2J\x1B[H");
-        let sep = "─".repeat(self.width + 4);
-        println!("┌{}┐", sep);
-        println!("│ CREEP-SIM  Tick: {:>4} {:>20} │", self.tick, "");
-        println!("├{}┤", sep);
-        for y in 0..self.height {
-            print!("│ ");
-            for x in 0..self.width {
-                let pos = Position {
-                    x: x as i32,
-                    y: y as i32,
-                };
-                let ch = self
-                    .entities
-                    .iter()
-                    .find_map(|e| {
-                        if e.pos == pos {
-                            Some(match e.entity_type {
-                                EntityType::Creep => {
-                                    if e.carry > 0 {
-                                        'C'
-                                    } else {
-                                        'c'
-                                    }
-                                }
-                                EntityType::Source => {
-                                    if e.resource_amount > 0 {
-                                        'E'
-                                    } else {
-                                        'e'
-                                    }
-                                }
-                                EntityType::Spawn => 'S',
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| match self.tiles[y][x] {
-                        TileType::Plain => '.',
-                        TileType::Wall => '#',
-                        TileType::Swamp => '~',
-                    });
-                print!("{}", ch);
-            }
-            println!(" │");
-        }
-        println!("└{}┘", sep);
-        // ── Панель сущностей ──
-        // Каждый крип — ровно одна строка.
-        // SPAWN не показывается как "действие крипа" — это глобальное событие.
-        let mut creep_lines: Vec<String> = Vec::new();
-        let mut source_lines: Vec<String> = Vec::new();
-        let mut spawn_entity_lines: Vec<String> = Vec::new();
-
-        for e in &self.entities {
-            match e.entity_type {
-                EntityType::Creep => {
-                    let action_str = match &e.last_action {
-                        Some(Action::Move { target, reason }) => {
-                            format!("MOVE ({},{}) [{}]", target.x, target.y, reason)
-                        }
-                        Some(Action::MoveTo { target, reason }) => {
-                            let pos = e.pos;
-                            let tgt = *target;
-                            if pos == tgt {
-                                format!("ARRIVED ({},{})", tgt.x, tgt.y)
-                            } else {
-                                format!("MOVETO ({},{}) [{}]", tgt.x, tgt.y, reason)
-                            }
-                        }
-                        Some(Action::Harvest { target_id }) => {
-                            format!("HARVEST {}", target_id)
-                        }
-                        Some(Action::Transfer { target_id, amount, .. }) => {
-                            format!("TRANSFER {} -> {}", amount, target_id)
-                        }
-                        // Spawn как "действие крипа" не показываем —
-                        // это событие before_tick, а не команда крипа.
-                        // Вместо этого крип покажется как "NEW" в отдельном блоке.
-                        Some(Action::Spawn { name, .. }) => {
-                            format!("NEW (spawned as {})", name)
-                        }
-                        Some(Action::Idle { reason }) => {
-                            format!("IDLE [{}]", reason)
-                        }
-                        None => "—".to_string(),
-                    };
-                    let carry_mark = if e.carry > 0 && e.carry_capacity > 0 { 'C' } else { 'c' };
-                    creep_lines.push(format!(
-                        "  {} {} ({},{})  hp:{}/{}  carry:{}/{}  {}",
-                        carry_mark, e.id, e.pos.x, e.pos.y,
-                        e.hp, e.max_hp, e.carry, e.carry_capacity, action_str
-                    ));
-                }
-                EntityType::Source => {
-                    source_lines.push(format!(
-                        "  [SOURCE] {}  ({},{})  energy: {}",
-                        e.id, e.pos.x, e.pos.y, e.resource_amount
-                    ));
-                }
-                EntityType::Spawn => {
-                    let cd_str = if e.spawn_cooldown > 0 {
-                        format!("  cd:{}", e.spawn_cooldown)
-                    } else {
-                        "  ready".to_string()
-                    };
-                    spawn_entity_lines.push(format!(
-                        "  [SPAWN]  {}  ({},{})  stored: {}{}",
-                        e.id, e.pos.x, e.pos.y, e.energy, cd_str
-                    ));
-                }
-            }
-        }
-
-        for line in &spawn_entity_lines { println!("{}", line); }
-        for line in &source_lines { println!("{}", line); }
-        for line in &creep_lines { println!("{}", line); }
-        println!();
-        println!("  Legend: # wall | . plain | S spawn | E source | c/C creep");
-        println!();
-        println!("  MEMORY:");
-        match engine.format_memory() {
-            Ok(s) => println!("{}", s),
-            Err(e) => println!("  (error: {})", e),
-        }
-        println!();
-    }
 }
 
 // ═══════════════════════════════════════
@@ -1408,6 +924,7 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::pathfinding;
 
     #[test]
     fn test_move_speed() {
@@ -1441,7 +958,7 @@ mod tests {
             vec![TileType::Plain, TileType::Wall, TileType::Plain],
             vec![TileType::Plain, TileType::Plain, TileType::Plain],
         ];
-        let path = astar(
+        let path = pathfinding::astar(
             &tiles, 3, 3, &[],
             Position { x: 0, y: 0 },
             Position { x: 2, y: 2 },
@@ -1466,7 +983,7 @@ mod tests {
             vec![TileType::Plain, TileType::Plain, TileType::Plain],
         ];
         // Swamp разрешён: кратчайший путь через него
-        let path = astar(
+        let path = pathfinding::astar(
             &tiles, 3, 2, &[],
             Position { x: 0, y: 0 },
             Position { x: 2, y: 0 },
@@ -1484,7 +1001,7 @@ mod tests {
             vec![TileType::Plain, TileType::Plain, TileType::Plain],
         ];
         // Swamp запрещён: путь в обход
-        let path = astar(
+        let path = pathfinding::astar(
             &tiles, 3, 2, &[],
             Position { x: 0, y: 0 },
             Position { x: 2, y: 0 },
@@ -1507,7 +1024,7 @@ mod tests {
             vec![TileType::Wall, TileType::Wall, TileType::Wall],
             vec![TileType::Plain, TileType::Wall, TileType::Plain],
         ];
-        let path = astar(
+        let path = pathfinding::astar(
             &tiles, 3, 3, &[],
             Position { x: 0, y: 0 },
             Position { x: 2, y: 2 },
@@ -1519,7 +1036,7 @@ mod tests {
     #[test]
     fn test_astar_same_position() {
         let tiles = vec![vec![TileType::Plain]];
-        let path = astar(
+        let path = pathfinding::astar(
             &tiles, 1, 1, &[],
             Position { x: 0, y: 0 },
             Position { x: 0, y: 0 },
@@ -1536,7 +1053,7 @@ mod tests {
         ];
         let blocker = Position { x: 1, y: 0 };
         // Цель — на блокере, путь должен существовать (целевая клетка разрешена)
-        let path = astar(
+        let path = pathfinding::astar(
             &tiles, 3, 2, &[blocker],
             Position { x: 0, y: 0 },
             Position { x: 1, y: 0 },
@@ -1545,7 +1062,7 @@ mod tests {
         assert!(path.is_some());
 
         // Пройти через блокер нельзя
-        let path = astar(
+        let path = pathfinding::astar(
             &tiles, 3, 2, &[blocker],
             Position { x: 0, y: 0 },
             Position { x: 2, y: 0 },
@@ -1589,7 +1106,7 @@ mod tests {
 
     #[test]
     fn test_spawn_creep_basic() {
-        let mut world = World::from_map(&[
+        let mut world = GameState::from_map(&[
             "#####",
             "#S.c#",
             "#####",
@@ -1624,7 +1141,7 @@ mod tests {
 
     #[test]
     fn test_spawn_not_enough_energy() {
-        let mut world = World::from_map(&[
+        let mut world = GameState::from_map(&[
             "#####",
             "#S.c#",
             "#####",
@@ -1645,7 +1162,7 @@ mod tests {
 
     #[test]
     fn test_spawn_cooldown() {
-        let mut world = World::from_map(&[
+        let mut world = GameState::from_map(&[
             "#####",
             "#S.c#",
             "#####",
@@ -1674,8 +1191,8 @@ mod tests {
         assert_eq!(world.entities.len(), 3); // не создался
     }
 
-    /// Интеграционный тест: Memory персистентна через World.tick()
-    /// Проверяем полный цикл: World → ScriptEngine → Lua decide() → Memory → Rust
+    /// Интеграционный тест: Memory персистентна через GameState.tick()
+    /// Проверяем полный цикл: GameState → ScriptEngine → Lua decide() → Memory → Rust
     #[test]
     fn test_memory_persists_through_world_tick() {
         let engine = ScriptEngine::new().unwrap();
@@ -1694,7 +1211,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut world = World::from_map(&[
+        let mut world = GameState::from_map(&[
             ".....",
             ".Sc..",
             "..E..",
@@ -1744,7 +1261,7 @@ mod tests {
         );
     }
 
-    /// Интеграционный тест: harvester.lua использует Memory через World.tick()
+    /// Интеграционный тест: harvester.lua использует Memory через GameState.tick()
     /// Проверяем, что реальный скрипт пишет в Memory.creeps
     #[test]
     fn test_harvester_lua_uses_memory() {
@@ -1757,7 +1274,7 @@ mod tests {
             "....c....",
             "..........",
         ];
-        let mut world = World::from_map(&map);
+        let mut world = GameState::from_map(&map);
         world.view_range = 50;
         world
             .register_lua_functions(&engine)
@@ -1788,7 +1305,7 @@ mod tests {
     /// Тест: process_spawn генерирует уникальное имя при дубликате
     #[test]
     fn test_spawn_unique_name_on_duplicate() {
-        let mut world = World::from_map(&[
+        let mut world = GameState::from_map(&[
             "#####",
             "#S.c#",
             "#####",
@@ -1855,7 +1372,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut world = World::from_map(&[
+        let mut world = GameState::from_map(&[
             ".....",
             ".Sc..",
             "..E..",
@@ -1922,7 +1439,7 @@ mod tests {
             .unwrap();
 
         // Карта БЕЗ крипов — только спавн и источник
-        let mut world = World::from_map(&[
+        let mut world = GameState::from_map(&[
             ".....",
             ".SE..",
             ".....",

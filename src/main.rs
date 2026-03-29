@@ -1,11 +1,12 @@
-mod lua_api;
-mod world;
+mod game;
+mod render;
+mod script;
 
-use lua_api::ScriptEngine;
+use game::state::GameState;
+use script::ScriptEngine;
 use std::thread;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use world::World;
 
 const MAP: &[&str] = &[
     "#############################",
@@ -24,7 +25,7 @@ const TICK_DELAY_MS: u64 = 30;
 
 fn main() {
     // ── Logging ───────────────────────────────────────────
-    // Архитектура: game logic (world.rs, lua_api.rs) использует
+    // Архитектура: game logic (game/, script/) использует
     // только tracing-макросы — без привязки к конкретному бэкенду.
     // Бэкенд (file / console / будущий UI-layer) настраивается здесь.
     //
@@ -67,13 +68,13 @@ fn main() {
     thread::sleep(Duration::from_secs(2));
 
     // ── World setup ────────────────────────────────────────
-    let mut world = World::from_map(MAP);
-    world.view_range = 50;
+    let mut game = GameState::from_map(MAP);
+    game.view_range = 50;
 
     let engine = ScriptEngine::new().expect("Failed to create Lua VM");
 
     // Регистрируем Lua-функции, зависящие от состояния мира (find_path, get_tile)
-    world
+    game
         .register_lua_functions(&engine)
         .expect("Failed to register world Lua functions");
 
@@ -83,8 +84,8 @@ fn main() {
 
     // ── Game loop ──────────────────────────────────────────
     for tick_num in 0..TOTAL_TICKS {
-        world.tick(&engine);
-        world.render(&engine);
+        game.tick(&engine);
+        render::render(&game, &engine);
         thread::sleep(Duration::from_millis(TICK_DELAY_MS));
 
         if tick_num > 0 && tick_num % 500 == 0 {
@@ -92,7 +93,7 @@ fn main() {
         }
     }
 
-    tracing::info!(total_ticks = world.tick, "simulation complete");
+    tracing::info!(total_ticks = game.tick, "simulation complete");
 
     // writer_guard dropped here → flushes remaining log entries
     drop(writer_guard);
@@ -100,7 +101,7 @@ fn main() {
     print!("\x1B[2J\x1B[H");
     println!();
     println!("══════════════════════════════════════");
-    println!("  Simulation complete. {} ticks played.", world.tick);
+    println!("  Simulation complete. {} ticks played.", game.tick);
     println!("  Log file: logs/rust-creeps.log");
     println!("  Run again: cargo run");
     println!("══════════════════════════════════════");
