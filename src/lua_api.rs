@@ -62,6 +62,15 @@ impl UnitContext {
     }
 }
 
+/// Форматирует Lua-число (Integer или Number) в строку.
+fn fmt_num(val: &mlua::Value) -> String {
+    match val {
+        mlua::Value::Integer(n) => n.to_string(),
+        mlua::Value::Number(n) => format!("{:.0}", n),
+        _ => "?".to_string(),
+    }
+}
+
 pub struct ScriptEngine {
     lua: Lua,
 }
@@ -149,6 +158,61 @@ impl ScriptEngine {
                 Value::String(s) => Ok(Some(s.to_string_lossy().to_string())),
                 _ => Ok(None),
             }
+        })
+    }
+
+    /// Возвращает форматированную строку с содержимым Memory для отображения в UI.
+    pub fn format_memory(&self) -> LuaResult<String> {
+        self.with_lua(|lua| {
+            let memory: mlua::Table = lua.globals().get("Memory")?;
+            let mut lines = Vec::new();
+
+            // spawn_count
+            let count: mlua::Value = memory.get("spawn_count")?;
+            if let mlua::Value::Integer(n) = count {
+                lines.push(format!("  spawn_count: {}", n));
+            }
+
+            // creeps
+            let creeps: mlua::Value = memory.get("creeps")?;
+            if let mlua::Value::Table(t) = creeps {
+                let mut entries: Vec<(String, String)> = Vec::new();
+                for pair in t.pairs::<mlua::Value, mlua::Table>() {
+                    if let (mlua::Value::String(id), Ok(info)) = pair {
+                        let tick: mlua::Value = info.get("tick")?;
+                        let carry: mlua::Value = info.get("carry")?;
+                        let pos: mlua::Value = info.get("pos")?;
+                        let pos_str = if let mlua::Value::Table(p) = pos {
+                            let x: mlua::Value = p.get("x")?;
+                            let y: mlua::Value = p.get("y")?;
+                            format!("({},{})", fmt_num(&x), fmt_num(&y))
+                        } else {
+                            "?".to_string()
+                        };
+                        entries.push((
+                            id.to_string_lossy().to_string(),
+                            format!(
+                                "tick:{} carry:{} pos:{}",
+                                fmt_num(&tick),
+                                fmt_num(&carry),
+                                pos_str
+                            ),
+                        ));
+                    }
+                }
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                if !entries.is_empty() {
+                    lines.push(format!("  creeps ({}):", entries.len()));
+                    for (id, info) in &entries {
+                        lines.push(format!("    {}  {}", id, info));
+                    }
+                }
+            }
+
+            if lines.is_empty() {
+                lines.push("  (empty)".to_string());
+            }
+            Ok(lines.join("\n"))
         })
     }
 

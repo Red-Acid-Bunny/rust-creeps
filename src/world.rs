@@ -1167,7 +1167,7 @@ impl World {
         }
     }
 
-    pub fn render(&self) {
+    pub fn render(&self, engine: &ScriptEngine) {
         print!("\x1B[2J\x1B[H");
         let sep = "─".repeat(self.width + 4);
         println!("┌{}┐", sep);
@@ -1255,6 +1255,12 @@ impl World {
         }
         println!();
         println!("  Legend: # wall | . plain | S spawn | E source | c/C creep");
+        println!();
+        println!("  MEMORY:");
+        match engine.format_memory() {
+            Ok(s) => println!("{}", s),
+            Err(e) => println!("  (error: {})", e),
+        }
         println!();
     }
 }

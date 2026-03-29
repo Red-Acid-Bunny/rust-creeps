@@ -84,7 +84,7 @@ fn main() {
     // ── Game loop ──────────────────────────────────────────
     for tick_num in 0..TOTAL_TICKS {
         world.tick(&engine);
-        world.render();
+        world.render(&engine);
         thread::sleep(Duration::from_millis(TICK_DELAY_MS));
 
         if tick_num > 0 && tick_num % 500 == 0 {
