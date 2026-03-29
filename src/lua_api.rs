@@ -80,11 +80,73 @@ impl ScriptEngine {
         tracing::debug!("creating Lua VM with sandbox");
         let lua = Lua::new();
         lua.load(r#"
-            function distance(a, b) return math.abs(a.x - b.x) + math.abs(a.y - b.y) end
+            -- Block dangerous globals
             os, io, debug, require, dofile, loadfile, load, package = nil, nil, nil, nil, nil, nil, nil, nil
+
+            -- Block dangerous string functions
+            local _string = string
+            local _safe_string = {
+                byte = _string.byte,
+                char = _string.char,
+                find = _string.find,
+                format = _string.format,
+                gmatch = _string.gmatch,
+                gsub = _string.gsub,
+                len = _string.len,
+                lower = _string.lower,
+                match = _string.match,
+                rep = _string.rep,
+                reverse = _string.reverse,
+                sub = _string.sub,
+                upper = _string.upper,
+            }
+            string = setmetatable(_safe_string, {
+                __index = function(_, key) return nil end,
+                __newindex = function(_, key, value)
+                    if _safe_string[key] ~= nil or key == "dump" then
+                        -- silently block reassignment of dangerous functions
+                        return
+                    end
+                    rawset(_safe_string, key, value)
+                end,
+            })
+
+            -- Lock down metatables to prevent sandbox escape
             local _mt = getmetatable(_G) or {}
             _mt.__index = function(_, key) return nil end
+            _mt.__newindex = function(_, key, value)
+                if key == "string" or key == "table" or key == "math" or key == "coroutine" then
+                    return -- prevent replacing safe libraries
+                end
+                rawset(_G, key, value)
+            end
             setmetatable(_G, _mt)
+
+            -- Prevent debug library access through metatable manipulation
+            local _table = table
+            table = setmetatable({}, {
+                __index = function(_, key)
+                    if key == "getmetatable" or key == "setmetatable" then
+                        return nil -- block metatable access through table library
+                    end
+                    return _table[key]
+                end,
+            })
+
+            -- Limit coroutine (can be used to escape sandbox)
+            local _coroutine = coroutine
+            coroutine = setmetatable({
+                create = _coroutine.create,
+                resume = _coroutine.resume,
+                running = _coroutine.running,
+                status = _coroutine.status,
+                wrap = _coroutine.wrap,
+                yield = _coroutine.yield,
+            }, {
+                __index = function(_, key) return nil end,
+            })
+
+            function distance(a, b) return math.abs(a.x - b.x) + math.abs(a.y - b.y) end
         "#)
         .exec()?;
 
@@ -178,7 +240,7 @@ impl ScriptEngine {
             if let mlua::Value::Table(t) = creeps {
                 let mut entries: Vec<(String, String)> = Vec::new();
                 for pair in t.pairs::<mlua::Value, mlua::Table>() {
-                    if let (mlua::Value::String(id), Ok(info)) = pair {
+                    if let Ok((mlua::Value::String(id), info)) = pair {
                         let tick: mlua::Value = info.get("tick")?;
                         let carry: mlua::Value = info.get("carry")?;
                         let pos: mlua::Value = info.get("pos")?;
