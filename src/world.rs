@@ -132,6 +132,7 @@ impl World {
         let mut tiles = vec![vec![TileType::Plain; width]; height];
         let mut entities = Vec::new();
         let mut creep_count = 0u32;
+        let mut source_count = 0u32;
 
         for (y, row) in map_strings.iter().enumerate() {
             for (x, ch) in row.chars().enumerate() {
@@ -152,14 +153,17 @@ impl World {
                         },
                         300,
                     )),
-                    'E' => entities.push(Entity::new_source(
-                        "source1",
-                        Position {
-                            x: x as i32,
-                            y: y as i32,
-                        },
-                        1000,
-                    )),
+                    'E' => {
+                        source_count += 1;
+                        entities.push(Entity::new_source(
+                            &format!("source_{}", source_count),
+                            Position {
+                                x: x as i32,
+                                y: y as i32,
+                            },
+                            1000,
+                        ))
+                    }
                     'c' => {
                         creep_count += 1;
                         entities.push(Entity::new_creep(
@@ -197,9 +201,21 @@ impl World {
         tracing::info!(
             width = world.width,
             height = world.height,
-            creeps = world.entities.iter().filter(|e| e.entity_type == EntityType::Creep).count(),
-            sources = world.entities.iter().filter(|e| e.entity_type == EntityType::Source).count(),
-            spawns = world.entities.iter().filter(|e| e.entity_type == EntityType::Spawn).count(),
+            creeps = world
+                .entities
+                .iter()
+                .filter(|e| e.entity_type == EntityType::Creep)
+                .count(),
+            sources = world
+                .entities
+                .iter()
+                .filter(|e| e.entity_type == EntityType::Source)
+                .count(),
+            spawns = world
+                .entities
+                .iter()
+                .filter(|e| e.entity_type == EntityType::Spawn)
+                .count(),
             "world created"
         );
 
@@ -374,7 +390,8 @@ impl World {
                         }
                     } else {
                         tracing::warn!(
-                            target.x = target.x, target.y = target.y,
+                            target.x = target.x,
+                            target.y = target.y,
                             "path blocked or already at target"
                         );
                     }
@@ -398,7 +415,8 @@ impl World {
                     }
                     if !creep.has_capacity() {
                         tracing::warn!(
-                            carry = creep.carry, capacity = creep.carry_capacity,
+                            carry = creep.carry,
+                            capacity = creep.carry_capacity,
                             "harvest failed: carry full"
                         );
                         return;

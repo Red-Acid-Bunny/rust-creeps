@@ -9,18 +9,18 @@ use world::World;
 
 const MAP: &[&str] = &[
     "##############",
-    "#S.#.........#",
+    "#S...........#",
     "##.#.#....c..#",
     "#..#.#.......#",
     "#.##.#.......#",
     "#....#...E...#",
     "######.......#",
-    "#...........c#",
+    "#E..........c#",
     "##############",
 ];
 
 const TOTAL_TICKS: u64 = 4500;
-const TICK_DELAY_MS: u64 = 300;
+const TICK_DELAY_MS: u64 = 30;
 
 fn main() {
     // ── Logging ───────────────────────────────────────────
@@ -68,7 +68,7 @@ fn main() {
 
     // ── World setup ────────────────────────────────────────
     let mut world = World::from_map(MAP);
-    world.view_range = 20;
+    world.view_range = 50;
 
     let engine = ScriptEngine::new().expect("Failed to create Lua VM");
     engine
