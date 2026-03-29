@@ -126,6 +126,32 @@ impl ScriptEngine {
         f(&self.lua)
     }
 
+    /// Читает число из Memory[key]. Для тестов.
+    /// Возвращает None если Memory[key] не существует или не число.
+    pub fn get_memory_number(&self, key: &str) -> LuaResult<Option<f64>> {
+        self.with_lua(|lua| {
+            let memory: mlua::Table = lua.globals().get("Memory")?;
+            let val: mlua::Value = memory.get(key)?;
+            match val {
+                mlua::Value::Integer(n) => Ok(Some(n as f64)),
+                mlua::Value::Number(n) => Ok(Some(n)),
+                _ => Ok(None),
+            }
+        })
+    }
+
+    /// Читает строку из Memory[key]. Для тестов.
+    pub fn get_memory_string(&self, key: &str) -> LuaResult<Option<String>> {
+        self.with_lua(|lua| {
+            let memory: mlua::Table = lua.globals().get("Memory")?;
+            let val: Value = memory.get(key)?;
+            match val {
+                Value::String(s) => Ok(Some(s.to_string_lossy().to_string())),
+                _ => Ok(None),
+            }
+        })
+    }
+
     fn context_to_lua(&self, ctx: &UnitContext) -> LuaResult<Table> {
         let pos_table = self.lua.create_table()?;
         pos_table.set("x", ctx.pos.x)?;

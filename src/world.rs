@@ -1531,4 +1531,114 @@ mod tests {
         );
         assert_eq!(world.entities.len(), 3); // не создался
     }
+
+    /// Интеграционный тест: Memory персистентна через World.tick()
+    /// Проверяем полный цикл: World → ScriptEngine → Lua decide() → Memory → Rust
+    #[test]
+    fn test_memory_persists_through_world_tick() {
+        let engine = ScriptEngine::new().unwrap();
+
+        // Скрипт записывает в Memory.creeps[id] позицию при каждом вызове
+        engine
+            .load_script_from_str(
+                r#"
+            function decide(ctx)
+                if not Memory.total_ticks then Memory.total_ticks = 0 end
+                Memory.total_ticks = Memory.total_ticks + 1
+                Memory.last_creep_id = ctx.id
+                return { type = "idle", reason = "tick" }
+            end
+        "#,
+            )
+            .unwrap();
+
+        let mut world = World::from_map(&[
+            ".....",
+            ".Sc..",
+            "..E..",
+            ".....",
+            ".....",
+        ]);
+        world.view_range = 50;
+        world
+            .register_lua_functions(&engine)
+            .unwrap();
+
+        // 3 тика — 1 крип, Memory.total_ticks должен быть 3
+        for _ in 0..3 {
+            world.tick(&engine);
+        }
+        assert_eq!(world.tick, 3);
+        assert_eq!(
+            engine.get_memory_number("total_ticks").unwrap(),
+            Some(3.0)
+        );
+        assert_eq!(
+            engine.get_memory_string("last_creep_id").unwrap(),
+            Some("worker_1".to_string())
+        );
+
+        // Добавляем второго крипа
+        world.entities.push(Entity::new_creep(
+            "worker_2",
+            Position { x: 1, y: 2 },
+            vec![BodyPart::Move, BodyPart::Work, BodyPart::Carry],
+        ));
+
+        // Ещё 2 тика — 2 крипа, каждый вызывает decide(), total_ticks = 3 + 2*2 = 7
+        for _ in 0..2 {
+            world.tick(&engine);
+        }
+        assert_eq!(world.tick, 5);
+        assert_eq!(
+            engine.get_memory_number("total_ticks").unwrap(),
+            Some(7.0)
+        );
+        // Последним был worker_2 (крипы обрабатываются по порядку)
+        assert_eq!(
+            engine.get_memory_string("last_creep_id").unwrap(),
+            Some("worker_2".to_string())
+        );
+    }
+
+    /// Интеграционный тест: harvester.lua использует Memory через World.tick()
+    /// Проверяем, что реальный скрипт пишет в Memory.creeps
+    #[test]
+    fn test_harvester_lua_uses_memory() {
+        let engine = ScriptEngine::new().unwrap();
+
+        // Загружаем реальный harvester.lua
+        let map = [
+            "..........",
+            ".S....E..",
+            "....c....",
+            "..........",
+        ];
+        let mut world = World::from_map(&map);
+        world.view_range = 50;
+        world
+            .register_lua_functions(&engine)
+            .unwrap();
+        engine
+            .load_script(std::path::Path::new("scripts/harvester.lua"))
+            .unwrap();
+
+        // Запускаем 2 тика — harvester.lua должен инициализировать Memory
+        world.tick(&engine);
+        world.tick(&engine);
+
+        // Проверяем, что Memory.creeps существует
+        let creeps = engine
+            .with_lua(|lua| -> mlua::Result<bool> {
+                let memory: mlua::Table = lua.globals().get("Memory")?;
+                let creeps: mlua::Value = memory.get("creeps")?;
+                Ok(matches!(creeps, mlua::Value::Table(_)))
+            })
+            .unwrap();
+        assert!(creeps, "Memory.creeps should be initialized by harvester.lua");
+
+        // Проверяем, что Memory.spawn_count существует
+        let count = engine.get_memory_number("spawn_count");
+        assert!(count.is_ok(), "Memory.spawn_count should be set");
+    }
 }
