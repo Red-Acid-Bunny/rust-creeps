@@ -21,13 +21,15 @@
    - 4.3 [BodyPart](#43-bodypart)
    - 4.4 [Entity](#44-entity)
    - 4.5 [World](#45-world)
-5. [main.rs — Точка входа](#6-mainrs--точка-входа)
-6. [Lua-скрипты](#7-lua-скрипты)
-   - 6.1 [simple.lua](#71-simplelua)
-   - 6.2 [harvester.lua](#72-harvesterlua)
-7. [Как работает игровой тик (пошагово)](#8-как-работает-игровой-тик-пошагово)
-8. [Зависимости (Cargo.toml)](#9-зависимости-cargotoml)
-9. [Рекомендации по улучшению архитектуры](#10-рекомендации-по-улучшению-архитектуры)
+   - 4.6 [A* Pathfinding — `astar()`](#46-a-pathfinding--astar)
+5. [main.rs — Точка входа](#5-mainrs--точка-входа)
+6. [Lua-скрипты](#6-lua-скрипты)
+   - 6.1 [simple.lua](#61-simplelua)
+   - 6.2 [harvester.lua](#62-harvesterlua)
+   - 6.3 [Глобальные Lua-функции](#63-глобальные-lua-функции)
+7. [Как работает игровой тик (пошагово)](#7-как-работает-игровой-тик-пошагово)
+8. [Зависимости (Cargo.toml)](#8-зависимости-cargotoml)
+9. [Рекомендации по улучшению архитектуры](#9-рекомендации-по-улучшению-архитектуры)
 
 ---
 
@@ -37,6 +39,7 @@
 ┌─────────────────────────────────────────────────┐
 │                   main.rs                        │
 │  Определяет MAP, создаёт World и ScriptEngine,  │
+│  регистрирует Lua-функции, настраивает logging, │
 │  запускает игровой цикл: tick() → render()      │
 └───────────┬──────────────────────┬──────────────┘
             │                      │
@@ -48,11 +51,14 @@
    │  - entities[]   │    │  - load_script()  │
    │  - tick()       │◄──►│  - call_decide()  │
    │  - render()     │    │  - parse_action() │
-   │                 │    │                   │
-   │  Entity:        │    │  Типы:            │
-   │  - Creep        │    │  - Action         │
-   │  - Source       │    │  - Position       │
-   │  - Spawn        │    │  - UnitContext    │
+   │  - astar()      │    │  - with_lua()     │
+   │  - register_    │    │                   │
+   │    lua_funcs()  │    │  Типы:            │
+   │                 │    │  - Action         │
+   │  Entity:        │    │  - Position       │
+   │  - Creep        │    │  - UnitContext    │
+   │  - Source       │    │                   │
+   │  - Spawn        │    │                   │
    └─────────────────┘    └────────┬──────────┘
                                    │
                           ┌────────▼──────────┐
@@ -72,15 +78,19 @@
 rust-creeps/
 ├── Cargo.toml              # Конфигурация зависимостей
 ├── Cargo.lock              # Заблокированные версии (генерируется автоматически)
-├── .gitignore              # Игнорирует /target
+├── .gitignore              # Игнорирует /target и /logs
 ├── src/
-│   ├── main.rs             # Точка входа: карта, цикл симуляции
+│   ├── main.rs             # Точка входа: карта, логирование, цикл симуляции
 │   ├── lua_api.rs          # Lua VM, типы данных, парсинг действий
-│   └── world.rs            # Модель мира: тайлы, сущности, тики, рендеринг
-└── scripts/
-    ├── simple.lua           # Простой демо-скрипт (не используется в main.rs)
-    └── harvester.lua        # Скрипт харвестера (используется в main.rs)
+│   └── world.rs            # Модель мира: тайлы, сущности, pathfinding, тики, рендеринг
+├── scripts/
+│   ├── simple.lua           # Простой демо-скрипт (не используется в main.rs)
+│   └── harvester.lua        # Скрипт харвестера (используется в main.rs)
+└── logs/
+    └── rust-creeps.log      # Файл логов (создаётся при запуске)
 ```
+
+**`.gitignore`** содержит `/target` (артефакты сборки) и `/logs` (файлы логов). Важно: директория `logs/` создаётся автоматически при запуске программы.
 
 ---
 
@@ -91,7 +101,7 @@ rust-creeps/
 ### 3.1 Position
 
 ```rust
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Position { pub x: i32, pub y: i32 }
 ```
 
@@ -106,6 +116,7 @@ pub struct Position { pub x: i32, pub y: i32 }
 - `Copy` — неявное копирование при передаче
 - `Serialize, Deserialize` — конвертация в JSON (полезно для сохранения мира)
 - `PartialEq, Eq` — сравнение через `==` (нужно для проверок `pos == target`)
+- `Hash` — позволяет использовать Position как ключ в `HashMap` (нужно для A*-pathfinding: `HashMap<Position, u32>` — g-score)
 
 **Пример в Lua:**
 
@@ -123,6 +134,7 @@ print(pos.x, pos.y)  -- 9, 5
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     Move { target: Position, reason: String },
+    MoveTo { target: Position, reason: String },
     Harvest { target_id: String },
     Transfer { target_id: String, resource: String, amount: u32 },
     Idle { reason: String },
@@ -135,18 +147,25 @@ pub enum Action {
 
 | Вариант | Поля | Что делает в мире |
 |---------|------|-------------------|
-| `Move` | `target: Position`, `reason: String` | Делает один шаг к `target`. `reason` — чисто информационное поле для отображения в UI |
+| `Move` | `target: Position`, `reason: String` | Жадное (greedy) движение — делает до `move_speed()` шагов к `target` через `step_toward`. Не учитывает препятствия, может застрять у стен. `reason` — чисто информационное поле |
+| `MoveTo` | `target: Position`, `reason: String` | A* pathfinding к цели. Крип вычисляет полный путь и идёт по нему. Автоматически обходит стены и болота. Если цель непроходима (стена, источник, спавн) — перенаправляет на ближайшую проходимую клетку. Путь кэшируется на Entity |
 | `Harvest` | `target_id: String` | Добывает энергию из источника с ID `target_id`. Крип должен быть рядом (dist <= 1), иметь `Work`-часть и место в `carry` |
 | `Transfer` | `target_id`, `resource`, `amount` | Передаёт `amount` ресурса `resource` цели с ID `target_id`. Крип должен быть рядом |
 | `Idle` | `reason: String` | Ничего не делает. `reason` для отображения |
+
+**Разница между Move и MoveTo:**
+
+- `Move` — простой, жадный. Использует `step_toward()`, который делает один шаг в направлении цели. Если на пути стена — крип застрянет. Полезен для простых скриптов или когда путь гарантированно свободен.
+- `MoveTo` — умный, с A*. Вычисляет оптимальный путь с учётом стен и болота, кэширует его на Entity (`planned_path`), и проходит несколько шагов за тик (зависит от `move_speed()` и стоимости тайлов). Рекомендуемый способ движения.
 
 **Почему enum, а не struct:** В Screeps юнит выполняет ровно одно действие за тик. Enum гарантирует, что Lua вернёт именно один тип — Rust не может «забыть» обработать вариант, компилятор заставит расписать все ветки в `match`.
 
 **Как это выглядит в Lua:**
 
 ```lua
---Lua возвращает таблицу, Rust парсит её в enum
+-- Lua возвращает таблицу, Rust парсит её в enum
 return { type = "move", target = { x = 5, y = 10 }, reason = "иду к источнику" }
+return { type = "moveto", target = { x = 5, y = 10 }, reason = "going to source" }
 return { type = "harvest", target_id = "source1" }
 return { type = "transfer", target_id = "spawn1", resource = "energy", amount = 50 }
 return { type = "idle", reason = "нет целей" }
@@ -329,6 +348,35 @@ nearby_sources: [...] →     ctx.nearby_sources = [...]
 
 ---
 
+#### `with_lua<F, R>(&self, f: F) -> LuaResult<R>`
+
+```rust
+pub fn with_lua<F, R>(&self, f: F) -> LuaResult<R>
+where
+    F: FnOnce(&Lua) -> LuaResult<R>,
+{
+    f(&self.lua)
+}
+```
+
+**Что это:** Предоставляет доступ к «сырому» экземпляру Lua VM. Через замыкание можно вызывать любые операции с Lua — в первую очередь, регистрировать глобальные функции.
+
+**Зачем нужен:** `ScriptEngine` не раскрывает поле `lua` наружу (инкапсуляция), но `World` должен иметь возможность добавлять свои функции (например `find_path`, `get_tile`). `with_lua()` — это контролируемый «bridge»: World вызывает его, получает `&Lua` на время замыкания, делает что нужно, и отдаёт контроль обратно.
+
+**Основное использование — `World::register_lua_functions()`:**
+
+```rust
+engine.with_lua(|lua| {
+    let find_path_fn = lua.create_function(...)?;
+    lua.globals().set("find_path", find_path_fn)?;
+    Ok(())
+})
+```
+
+**Почему замыкание, а не просто `&Lua`:** Это Rust-идиоматичный паттерн — не раскрывать внутреннее состояние. Если бы мы возвращали `&Lua` через геттер, вызывающий код мог бы случайно сделать что-то опасное. Через замыкание доступ строго ограничен по времени.
+
+---
+
 #### `fn context_to_lua(&self, ctx: &UnitContext) -> LuaResult<Table>` (приватный)
 
 Конвертирует Rust-структуру в Lua-таблицу. Создаёт вложенные таблицы:
@@ -344,13 +392,13 @@ Lua получает:
     carry_capacity = 50,
     tick = 42,
     nearby_sources = {
-        { id = "source1", pos = { x = 9, y = 5 }, resource_amount = 950 },
+        { id = "source1", pos = { x = 9, y: 5 }, resource_amount = 950 },
     },
     nearby_spawns = {
-        { id = "spawn1", pos = { x = 2, y = 2 }, resource_amount = 300 },
+        { id = "spawn1", pos = { x = 2, y: 2 }, resource_amount: 300 },
     },
     nearby_creeps = {
-        { id = "worker_2", pos = { x = 11, y = 7 }, resource_amount = 20 },
+        { id = "worker_2", pos = { x = 11, y: 7 }, resource_amount: 20 },
     },
 }
 ```
@@ -383,6 +431,7 @@ for (i, entity) in entities.iter().enumerate() {
 ```rust
 match action_type.as_str() {
     "move" => { ... Action::Move { target, reason } ... }
+    "moveto" => { ... Action::MoveTo { target, reason } ... }
     "harvest" => { ... Action::Harvest { target_id } ... }
     "transfer" => { ... Action::Transfer { target_id, resource, amount } ... }
     "idle" => { ... Action::Idle { reason } ... }
@@ -407,9 +456,25 @@ pub enum TileType { Plain, Wall, Swamp }
 
 | Вариант | Символ на карте | Проходимость |
 |---------|----------------|-------------|
-| `Plain` | `.` | Да, нормальная скорость |
+| `Plain` | `.` | Да, нормальная скорость (1 очко движения) |
 | `Wall` | `#` | Нет |
-| `Swamp` | `~` | Да, но должна замедлять (пока не реализовано) |
+| `Swamp` | `~` | Да, стоит 2 очка движения (константа `SWAMP_COST = 2`). Один шаг по болоту тратит 2 move_points вместо 1 |
+
+**Стоимость тайлов** определяется функцией `tile_move_cost()`:
+
+```rust
+pub const SWAMP_COST: u32 = 2;
+
+fn tile_move_cost(tile: TileType) -> u32 {
+    match tile {
+        TileType::Plain => 1,
+        TileType::Swamp => SWAMP_COST,
+        TileType::Wall => u32::MAX,  // непроходимо
+    }
+}
+```
+
+**Почему `u32::MAX` для Wall:** В A*-алгоритме стоимость стены = максимально возможное число. Это гарантирует, что путь через стену никогда не будет выбран — даже если альтернативный путь очень длинный, его стоимость всё равно будет меньше.
 
 `Copy` — потому что enum без данных внутри, копирование тривиально.
 
@@ -443,7 +508,7 @@ pub enum BodyPart { Move, Work, Carry, Attack, Tough }
 
 | Часть | Эффект при создании крипа |
 |-------|--------------------------|
-| `Move` | Позволяет двигаться (проверяется в `can_move()`) |
+| `Move` | Определяет скорость движения. Каждая часть Move = 1 клетка за тик. Например, `[Move, Move, Work, Carry]` даёт скорость 2. Крип без Move не может двигаться (скорость 0 — полезно для турелей) |
 | `Work` | Позволяет добывать ресурсы (проверяется в `can_work()`) |
 | `Carry` | Увеличивает `carry_capacity` на 50 |
 | `Attack` | Зарезервирован для будущей боевой системы |
@@ -466,17 +531,40 @@ pub fn new_creep(id: &str, pos: Position, body: Vec<BodyPart>) -> Self {
 }
 ```
 
+**Метод `move_speed()`:**
+
+```rust
+pub fn move_speed(&self) -> u32 {
+    self.body.iter().filter(|p| **p == BodyPart::Move).count() as u32
+}
+```
+
+Возвращает количество частей Move в теле крипа. Сейчас это просто счётчик, но метод абстрагирует скорость — в будущем можно заменить на систему веса, buff'ы/дебаффы, не трогая остальной код. Например, вместо простого счётчика можно будет учитывать массу (каждый Carry замедляет) или эффекты болота.
+
+**`can_move()` теперь использует `move_speed()`:**
+
+```rust
+pub fn can_move(&self) -> bool {
+    self.move_speed() > 0
+}
+```
+
 **Пример:** Крип с `[Move, Move, Work, Carry]`:
 
 - HP = 100 (базовое, нет Tough)
 - carry_capacity = 50 (один Carry)
-- Может двигаться и добывать
+- move_speed = 2 (две части Move)
+- Может двигаться (2 клетки/тик) и добывать
 
 Крип с `[Move, Tough, Tough, Work, Carry, Carry]`:
 
 - HP = 100 + 100 + 100 = 300
 - carry_capacity = 50 + 50 = 100
-- Может двигаться и добывать
+- move_speed = 1
+
+Крип с `[Work, Carry]` (нет Move):
+
+- move_speed = 0 — не может двигаться (турель)
 
 ---
 
@@ -495,6 +583,7 @@ pub struct Entity {
     pub carry_capacity: u32,
     pub body: Vec<BodyPart>,
     pub resource_amount: u32,
+    pub planned_path: Vec<Position>,  // Запланированный маршрут (используется MoveTo)
 }
 ```
 
@@ -502,12 +591,22 @@ pub struct Entity {
 
 **Почему не разные структуры для каждого типа:** Удобство поиска и хранения — все сущности в одном векторе `Vec<Entity>`, и фильтрация по `entity_type`. Недостаток — часть полей «тратится» впустую для некоторых типов. Для простоты проекта это допустимо.
 
+**Поле `planned_path`:**
+
+```rust
+pub planned_path: Vec<Position>,  // Запланированный маршрут (используется MoveTo)
+```
+
+При использовании `MoveTo` Rust вычисляет полный A*-путь от текущей позиции до цели и сохраняет его в `planned_path`. Каждый тик крип проходит несколько шагов из этого пути (в зависимости от `move_speed()`), а оставшаяся часть пути кэшируется. Путь пересчитывается только при смене цели. Для Source и Spawn это поле всегда пустое (они не двигаются).
+
+**Почему `#[serde(default)]`:** Это поле добавлено после первоначального дизайна. Атрибут `default` гарантирует, что при десериализации старых данных (без `planned_path`) поле получит значение `Vec::new()` вместо ошибки.
+
 **Конструкторы:**
 
 #### `Entity::new_source(id, pos, amount)`
 
 ```rust
-Entity::new_source("source1", Position { x: 9, y: 5 }, 1000)
+Entity::new_source("source_1", Position { x: 9, y: 5 }, 1000)
 ```
 
 Создаёт источник энергии с `resource_amount = 1000`. Все остальные поля — 0/пустые.
@@ -531,8 +630,9 @@ Entity::new_creep("worker_1", pos, vec![BodyPart::Move, BodyPart::Move, BodyPart
 **Методы-помощники:**
 
 ```rust
-pub fn can_move(&self) -> bool  // true если есть хотя бы одна часть Move
-pub fn can_work(&self) -> bool  // true если есть хотя бы одна часть Work
+pub fn move_speed(&self) -> u32   // количество частей Move (скорость)
+pub fn can_move(&self) -> bool    // true если move_speed() > 0
+pub fn can_work(&self) -> bool    // true если есть хотя бы одна часть Work
 pub fn has_capacity(&self) -> bool  // true если carry < carry_capacity
 ```
 
@@ -563,7 +663,7 @@ pub struct World {
 | `tiles` | `Vec<Vec<TileType>>` | 2D-массив тайлов. `tiles[y][x]` — сначала строка (y), потом столбец (x) |
 | `entities` | `Vec<Entity>` | Все сущности на карте (крипы, источники, спавны) |
 | `tick` | `u64` | Текущий номер тика (инкрементируется каждый `tick()`) |
-| `view_range` | `i32` | Радиус видимости юнитов (Манхэттенское расстояние). По умолчанию 10, в main.rs установлен в 20 |
+| `view_range` | `i32` | Радиус видимости юнитов (Манхэттенское расстояние). По умолчанию 10, в main.rs установлен в 50 |
 | `harvest_rate` | `u32` | Сколько энергии добывается за один тик. По умолчанию 10 |
 | `last_action` | `Action` | Последнее действие любого крипа (для отображения в UI) |
 
@@ -575,15 +675,15 @@ pub struct World {
 
 ```rust
 const MAP: &[&str] = &[
-    "##############",
-    "#............#",
-    "#.S.......c..#",
-    "#............#",
-    "#............#",
-    "#........E...#",
-    "#............#",
-    "#...........c#",
-    "##############",
+    "#############################",
+    "#S#...#...#......~~~~~~..#EE#",
+    "#.#.#.#.#.#.~~~~~~~~~~~..#EE#",
+    "#.#.#.#.#.#.~~.~~~~~~~~..#..#",
+    "#.#.#.#.#.#.~.........~c.#..#",
+    "#.#.#.#.#.#.~~~~~~~~.~~..#..#",
+    "#.#.#.#.#.#.~~~~~~~~.~~..#..#",
+    "#...#...#...~~~~~~~~..~.....#",
+    "#############################",
 ];
 
 let world = World::from_map(MAP);
@@ -595,14 +695,29 @@ let world = World::from_map(MAP);
 2. Заполняет `tiles[][]` по символам: `#` → Wall, `~` → Swamp, всё остальное → Plain
 3. Создаёт сущности по символам:
    - `S` → `Entity::new_spawn("spawn1", ...)`
-   - `E` → `Entity::new_source("source1", ...)`
+   - `E` → `Entity::new_source("source_N", ...)` с уникальным ID (см. ниже)
    - `c` → `Entity::new_creep("worker_N", ...)` с `N` = порядковый номер
 4. Все крипы получают тело `[Move, Move, Work, Carry]`
+5. После создания мира логируется информация о количестве сущностей через `tracing::info!`
 
-**Ограничения текущей реализации:**
+**Поддержка нескольких источников:**
 
-- Только один источник (`"source1"`) и один спавн (`"spawn1"`) — если на карте два `E`, второй получит тот же ID и затрёт первый
-- ID крипов генерируются автоматически: `worker_1`, `worker_2` и т.д.
+Раньше все источники получали одинаковый ID `"source1"`, и если на карте было несколько `E`, они затирали друг друга. Теперь используется счётчик `source_count` — каждый `E` на карте получает уникальный ID: `source_1`, `source_2`, и т.д. Аналогично для крипов (`worker_1`, `worker_2`).
+
+**Примечание:** Спавн по-прежнему один — `"spawn1"` (счётчик не реализован). Если на карте два `S`, второй получит тот же ID.
+
+---
+
+#### `register_lua_functions(&self, engine: &ScriptEngine) -> mlua::Result<()>`
+
+Регистрирует Lua-глобальные функции, зависящие от состояния мира. Вызывается один раз после создания World и ScriptEngine. Через `engine.with_lua()` добавляет в Lua VM:
+
+- `find_path(from, to [, opts])` — A* поиск пути. Возвращает массив таблиц `{x, y}` или `nil` если путь не найден. `opts` — таблица с полем `avoid`: если `avoid = "swamp"`, болота считаются стенами.
+- `get_tile(x, y)` — возвращает тип тайла: `"plain"`, `"wall"`, `"swamp"` или `nil`.
+
+**Почему это метод World, а не ScriptEngine:** Lua-функции `find_path` и `get_tile` должны знать о карте (тайлы, размеры, блокеры). `ScriptEngine` не имеет доступа к миру — это было бы нарушением инкапсуляции. Поэтому World сам регистрирует свои функции через `with_lua()`.
+
+**Подробное описание функций — см. [раздел 6.3](#63-глобальные-lua-функции).**
 
 ---
 
@@ -654,6 +769,39 @@ pub fn is_walkable(&self, pos: Position) -> bool {
 
 ---
 
+#### `find_nearest_walkable(&self, target: Position, max_dist: u32) -> Option<Position>` (приватный)
+
+BFS от целевой позиции. Ищет ближайшую проходимую клетку. Используется в `MoveTo` когда цель непроходима (стена, источник, спавн). Возвращает `None` если проходимых клеток нет в радиусе `max_dist`.
+
+**Как работает:**
+
+1. Если цель сама проходима — возвращает её сразу
+2. Иначе расширяет поиск по слоям (BFS: сначала все клетки на расстоянии 1, потом 2, и т.д.)
+3. Возвращает первую найденную проходимую клетку
+4. Имеет safety limit, чтобы не уходить в бесконечный цикл на аномальных картах
+
+**Пример:** Источник стоит в комнате, окружённой стенами. Крип хочет идти к источнику (непроходимая клетка). `find_nearest_walkable` находит ближайшую свободную клетку рядом с источником, и крип идёт туда.
+
+---
+
+#### `block_positions(&self) -> Vec<Position>` (приватный)
+
+Собирает позиции непроходимых сущностей (sources, spawns). Используется как список блокеров для A*:
+
+```rust
+fn block_positions(&self) -> Vec<Position> {
+    self.entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Source || e.entity_type == EntityType::Spawn)
+        .map(|e| e.pos)
+        .collect()
+}
+```
+
+**Почему отдельный метод, а не проверка внутри A*:** A* работает с «замороженной» картой — список блокеров вычисляется один раз перед поиском и передаётся в функцию. Это чище, чем передавать всю World (которая `&self`, а нам нужна изменяемость для других операций).
+
+---
+
 #### `step_toward(&self, from: Position, to: Position) -> Option<Position>`
 
 Жадный (greedy) алгоритм движения — один шаг к цели:
@@ -688,7 +836,7 @@ pub fn step_toward(&self, from: Position, to: Position) -> Option<Position> {
 - Кандидаты: `(4, 3)` и `(3, 4)`
 - Если `(4, 3)` проходима → идём туда
 
-**Это НЕ pathfinding.** Если на пути стена, крип попытается обойти (перейдёт к кандидату по Y), но не найдёт оптимальный путь. Для обхода препятствий нужен A*.
+**Это НЕ pathfinding.** Используется только действием `Move`. Действие `MoveTo` использует полноценный A*. Если на пути стена, `step_toward` попытается обойти (перейдёт к кандидату по Y), но не найдёт оптимальный путь.
 
 ---
 
@@ -708,7 +856,7 @@ World::distance(Position { x: 3, y: 3 }, Position { x: 9, y: 5 })  // = 8
 
 ```rust
 pub fn tick(&mut self, engine: &ScriptEngine) {
-    // 1. Собираем ID всех крипов (нужны только кривы)
+    // 1. Собираем ID всех крипов
     let creep_ids: Vec<String> = self.entities.iter()
         .filter(|e| e.entity_type == EntityType::Creep)
         .map(|e| e.id.clone()).collect();
@@ -716,8 +864,14 @@ pub fn tick(&mut self, engine: &ScriptEngine) {
     // 2. Для каждого крипа: контекст → Lua → action → применить
     for creep_id in &creep_ids {
         let creep = match self.get_entity(creep_id).cloned() { ... };
+        
+        // Создаём tracing span для диагностики
+        let span = tracing::info_span!("creep", id = %creep_id, tick = self.tick);
+        let _enter = span.enter();
+        
         let ctx = self.build_unit_context(&creep);
         let action = engine.call_decide(&ctx).unwrap_or_else(|err| {
+            tracing::error!(error = %err, "Lua error during decide()");
             Action::Idle { reason: format!("script error: {}", err) }
         });
         self.last_action = action.clone();
@@ -731,6 +885,8 @@ pub fn tick(&mut self, engine: &ScriptEngine) {
 **Почему клонируем данные крипа (`cloned()`):** Rust запрещает одновременно иметь неизменяемую ссылку на `self` (для поиска крипа) и изменяемую (для `apply_action`). Клонирование — самый простой способ обойти это. В будущем можно оптимизировать через `IndexMap` или разделение на фазы.
 
 **Почему сначала собираем все ID:** Если бы мы итерировали напрямую по `self.entities`, а `apply_action` потенциально добавлял бы новые сущности — это бы вызвало ошибку изменения коллекции во время итерации (borrow checker не пропустил бы).
+
+**Tracing span:** Каждый тик каждого крипа оборачивается в `info_span!("creep", id, tick)`. Все логи внутри (move, harvest, path и т.д.) автоматически привязываются к этому span — в файле логов видно, какие действия какой крип выполнил на каком тике.
 
 ---
 
@@ -751,45 +907,57 @@ let creeps = self.find_by_type(EntityType::Creep, creep.pos, self.view_range)
 
 #### `fn apply_action(&mut self, creep_id: &str, action: &Action)` (приватный)
 
-Применяет действие к миру. Разбирём каждую ветку:
-
-**Move:**
+Применяет действие к миру. Перед `match` очищает `planned_path` для всех действий кроме `MoveTo` — это гарантирует, что при смене цели старый путь не используется:
 
 ```rust
-Action::Move { target, reason: _ } => {
-    let creep = self.get_entity(creep_id).cloned();
-    if let Some(creep) = creep {
-        if creep.can_move() {
-            if let Some(new_pos) = self.step_toward(creep.pos, *target) {
-                if let Some(c) = self.get_entity_mut(creep_id) { c.pos = new_pos; }
-            }
-        }
+if !matches!(action, Action::MoveTo { .. }) {
+    if let Some(c) = self.get_entity_mut(creep_id) {
+        c.planned_path.clear();
     }
 }
 ```
 
-1. Получаем копию крипа (отпускаем borrow на `self`)
-2. Проверяем: есть ли часть `Move` в теле?
-3. Пытаемся сделать шаг через `step_toward`
-4. Если шаг удался — обновляем позицию
+Разбирём каждую ветку:
+
+**Move:**
+
+```rust
+Action::Move { target, reason } => { ... }
+```
+
+Жадное движение через `step_toward` — до `move_speed()` шагов за тик. Учитывает стоимость тайлов: если следующий шаг — болото (2 очка), а `move_points = 1` — крип останавливается. Путь не кэшируется. Используется для простых случаев, когда не нужен полноценный A*.
+
+**MoveTo:**
+
+```rust
+Action::MoveTo { target, reason } => { ... }
+```
+
+Полноценное A*-движение с кэшированием пути:
+
+```rust
+Action::MoveTo { target, reason } => {
+    // 1. Если цель непроходима → BFS находим ближайшую проходимую клетку
+    // 2. Если путь пуст или ведёт к другой цели → пересчитываем A*
+    // 3. Идём по пути до move_speed() шагов, учитывая стоимость болота
+    // 4. Кэшируем оставшийся путь с текущей позицией в индексе 0
+    // 5. Если не смогли сдвинуться → очищаем путь для пересчёта
+}
+```
+
+**Ключевые детали реализации:**
+
+- **Путь кэшируется на Entity** (`planned_path`), пересчитывается только когда цель меняется (сравнивается последний элемент пути с текущей целью)
+- **`path[0]` всегда текущая позиция** — это критично для цикла `for i in 1..path.len()`, который пропускает начальную точку
+- **Болото стоит 2 move_points** — если у крипа `move_speed() = 2` и следующий шаг на болото, он потратит все 2 очка на один шаг и остановится
+- **Если шаг заблокирован** (другая сущность встала на путь) — путь очищается и будет пересчитан на следующем тике
+- **WARN лог только один раз** — если путь не найден, предупреждение выводится только когда `planned_path` был пуст (первая попытка). Это предотвращает спам в логах при постоянной неудаче
+- **Автоматическое перенаправление непроходимых целей** — если целевая клетка стена, источник или спавн, `find_nearest_walkable()` находит ближайшую проходимую клетку и крип идёт туда
 
 **Harvest:**
 
 ```rust
-Action::Harvest { target_id } => {
-    let creep = self.get_entity(creep_id).cloned();
-    let source = self.get_entity(target_id).cloned();
-    if let (Some(creep), Some(source)) = (creep, source) {
-        if source.entity_type != EntityType::Source { return; }
-        if Self::distance(creep.pos, source.pos) > 1 { return; }
-        if !creep.can_work() || !creep.has_capacity() { return; }
-        let amount = self.harvest_rate.min(source.resource_amount).min(creep.carry_capacity - creep.carry);
-        if amount > 0 {
-            if let Some(s) = self.get_entity_mut(target_id) { s.resource_amount -= amount; }
-            if let Some(c) = self.get_entity_mut(creep_id) { c.carry += amount; }
-        }
-    }
-}
+Action::Harvest { target_id } => { ... }
 ```
 
 Валидации:
@@ -800,15 +968,23 @@ Action::Harvest { target_id } => {
 - У крипа есть место (`has_capacity`)
 - Количество = минимум из: `harvest_rate`, остаток источника, свободное место
 
+Все неуспешные проверки логируются через `tracing::warn!`.
+
 **Transfer:**
 
 ```rust
-Action::Transfer { target_id, resource: _, amount } => {
-    // analogous to Harvest but transfers carry → target.energy
-}
+Action::Transfer { target_id, resource, amount } => { ... }
 ```
 
-Передаёт `amount` из `carry` крипа в `energy` цели. Требует расстояние <= 1.
+Передаёт `amount` из `carry` крипа в `energy` цели. Требует расстояние <= 1. Если цель не найдена — `tracing::warn!`.
+
+**Idle:**
+
+```rust
+Action::Idle { reason } => {
+    tracing::info!(reason = %reason, "idle");
+}
+```
 
 ---
 
@@ -831,31 +1007,124 @@ print!("\x1B[2J\x1B[H");  // Очистка экрана и курсор в на
 
 ---
 
-## 6. main.rs — Точка входа
+### 4.6 A* Pathfinding — `astar()`
+
+Функция `astar()` в `world.rs` — полная реализация алгоритма A* для поиска оптимального пути на карте. Это отдельная функция (не метод World), что позволяет использовать её в том числе из Lua через `find_path`.
+
+```rust
+pub fn astar(
+    tiles: &[Vec<TileType>],
+    width: i32, height: i32,
+    blockers: &[Position],
+    from: Position, to: Position,
+    avoid_swamp: bool,
+) -> Option<Vec<Position>>
+```
+
+**Параметры:**
+
+| Параметр | Тип | Описание |
+|----------|-----|----------|
+| `tiles` | `&[Vec<TileType>]` | Карта тайлов |
+| `width`, `height` | `i32` | Размеры карты |
+| `blockers` | `&[Position]` | Позиции непроходимых сущностей (источники, спавны) |
+| `from` | `Position` | Стартовая позиция |
+| `to` | `Position` | Целевая позиция |
+| `avoid_swamp` | `bool` | Если `true`, болота считаются стенами (путь только по Plain) |
+
+**Возвращает:** Полный путь от `from` до `to` (включая обе точки), или `None` если путь не найден.
+
+**Алгоритм (пошагово):**
+
+1. **BinaryHeap как open-set** — используется `std::collections::BinaryHeap` с min-heap семантикой. Каждый элемент — `Node { pos, g, f }`. Чтобы получить min-heap из max-heap Rust, инвертируем `cmp`: `other.f.cmp(&self.f)`.
+
+2. **g-score** — стоимость пройденного пути. Хранится в `HashMap<Position, u32>`. Учитывает стоимость тайлов: Plain = 1, Swamp = `SWAMP_COST` (2).
+
+3. **f-score** = g + h, где h — эвристика (Манхэттенское расстояние до цели). f-score определяет порядок извлечения из кучи — первым извлекается узел с минимальным f.
+
+4. **came_from: HashMap<Position, Position>** — для восстановления пути. Когда алгоритм доходит до цели, проходит по цепочке `came_from` от цели к старту и разворачивает.
+
+5. **Пропуск устаревших записей** — в куче могут быть «устаревшие» узлы (если мы нашли лучший путь к уже посещённой позиции). Проверка `if current.g > *g_score.get(&current.pos)...` отсеивает их.
+
+**Стоимость тайлов** определяется функцией `tile_move_cost()`:
+
+| Тайл | Стоимость | Описание |
+|------|-----------|----------|
+| `Plain` | 1 | Обычный шаг |
+| `Swamp` | `SWAMP_COST` (2) | Замедляет движение |
+| `Wall` | `u32::MAX` | Непроходимо (путь через стену невозможен) |
+
+**Вспомогательные функции pathfinding:**
+
+- `in_bounds(pos, width, height)` — проверяет, что координаты внутри карты
+- `is_pos_walkable(tiles, pos, width, height, blockers)` — проверяет проходимость позиции (без учёта Entity, только тайлы и блокеры)
+- `find_adjacent_walkable(tiles, pos, width, height, blockers)` — ищет ближайшую проходимую клетку, смежную с `pos` (distance = 1). Используется в Lua-функции `find_path` для перенаправления на непроходимые цели
+
+---
+
+## 5. main.rs — Точка входа
 
 ```rust
 const MAP: &[&str] = &[ ... ];
 const TOTAL_TICKS: u64 = 4500;
-const TICK_DELAY_MS: u64 = 300;
+const TICK_DELAY_MS: u64 = 30;
 ```
 
-`MAP` — определение карты как массив строк. `TOTAL_TICKS` — сколько тиков отыграть. `TICK_DELAY_MS` — пауза между тиками в миллисекундах.
+`MAP` — определение карты как массив строк (см. [from_map](#worldfrom_mapmap_strings--self)). `TOTAL_TICKS` — сколько тиков отыграть. `TICK_DELAY_MS` — пауза между тиками в миллисекундах.
+
+**Настройка логирования:**
+
+```rust
+let log_dir = std::path::Path::new("logs");
+std::fs::create_dir_all(log_dir).expect("Failed to create logs directory");
+
+let file_appender = tracing_appender::rolling::never(log_dir, "rust-creeps.log");
+let (non_blocking, writer_guard) = tracing_appender::non_blocking(file_appender);
+
+tracing_subscriber::registry()
+    .with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_target(false),
+    )
+    .init();
+```
+
+**Архитектура логирования:**
+
+- Игровая логика (`world.rs`, `lua_api.rs`) использует **только** макросы `tracing` (`info!`, `warn!`, `debug!`, `error!`) — без привязки к конкретному бэкенду.
+- Бэкенд (файл, консоль, будущий UI-layer) настраивается **только в `main.rs`**.
+- Неблокирующая запись (`tracing_appender::non_blocking`) — логи пишутся в отдельном потоке, чтобы не тормозить игровой цикл.
+- Чтобы добавить вывод в UI, достаточно создать свой tracing Layer и подключить через `.with(my_ui_layer)`.
+- `writer_guard` удерживается до конца `main()` — при drop он сбрасывает оставшиеся буферизированные записи.
 
 **Игровой цикл:**
 
 ```rust
 let mut world = World::from_map(MAP);
-world.view_range = 20;  // переопределяем дальность видимости
+world.view_range = 50;  // дальность видимости
 
-let engine = ScriptEngine::new().expect("...");
-engine.load_script(Path::new("scripts/harvester.lua")).expect("...");
+let engine = ScriptEngine::new().expect("Failed to create Lua VM");
 
-for _ in 0..TOTAL_TICKS {
+// Регистрируем Lua-функции, зависящие от состояния мира (find_path, get_tile)
+world.register_lua_functions(&engine).expect("Failed to register world Lua functions");
+
+engine.load_script(Path::new("scripts/harvester.lua")).expect("Failed to load harvester.lua");
+
+for tick_num in 0..TOTAL_TICKS {
     world.tick(&engine);   // 1. Вычислить тик
     world.render();         // 2. Отрисовать
     thread::sleep(Duration::from_millis(TICK_DELAY_MS));  // 3. Подождать
 }
 ```
+
+**Порядок инициализации важен:**
+
+1. `World::from_map(MAP)` — создаёт мир
+2. `ScriptEngine::new()` — создаёт Lua VM с sandbox
+3. `world.register_lua_functions(&engine)` — регистрирует `find_path` и `get_tile` в Lua. **До этого вызова Lua-скрипты не могут использовать эти функции.**
+4. `engine.load_script(...)` — загружает harvester.lua (скрипт может использовать `find_path`, потому что он уже зарегистрирован)
 
 `.expect("...")` — метод `Result`, который "разворачивает" результат (достаёт значение) или паникует с сообщением. Удобно для программы, где ошибки критичны — лучше упасть сразу, чем молча продолжить без Lua.
 
@@ -863,9 +1132,9 @@ for _ in 0..TOTAL_TICKS {
 
 ---
 
-## 7. Lua-скрипты
+## 6. Lua-скрипты
 
-### 7.1 simple.lua
+### 6.1 simple.lua
 
 Демо-скрипт, не используется в основном цикле. Показывает базовый синтаксис:
 
@@ -899,86 +1168,160 @@ end
 
 ---
 
-### 7.2 harvester.lua
+### 6.2 harvester.lua
 
-Основной скрипт, используемый в симуляции. Реализует классический Screeps-паттерн «harvester»:
+Основной скрипт, используемый в симуляции. Реализует классический Screeps-паттерн «harvester» с A*-pathfinding:
+
+**Ключевые отличия от простой версии:**
+
+1. **`find_nearest_reachable_source()`** — вместо простого `distance()`, использует `find_path()` для проверки фактической достижимости. Возвращает источник с кратчайшим путём (по количеству шагов, `#path`). Если источник физически недостижим (стена между крипом и источником) — он игнорируется.
+
+2. **Все движение через `moveto`** — действие `MoveTo` с A*-pathfinding вместо `move` (greedy). Это позволяет крипу автоматически обходить стены и болота.
+
+3. **Точное сообщение idle** — `"no reachable sources in range"` вместо `"no sources"`. Разница важна: источник может быть в радиусе видимости, но недостижим из-за стен. Старое сообщение было неточным.
 
 **Логика:**
 
 1. Если крип несёт ресурс (`carry > 0`):
-   - Если груз полный **или** источник исчерпан → идти к спавну и передать
-   - Иначе (груз не полный, источник ещё есть) → продолжить добычу
+   - Если груз полный **или** нет доступных (достижимых) источников → идти к спавну через `moveto` и передать
+   - Иначе (груз не полный, источник достижим) → продолжить добычу
 2. Если крип пустой:
-   - Найти ближайший источник
-   - Если рядом (dist <= 1) → добывать
-   - Иначе → идти к источнику
-3. Запасной вариант → idle
+   - `find_nearest_reachable_source()` — найти ближайший достижимый источник
+   - Если рядом (path length <= 1) → добывать
+   - Иначе → `moveto` к источнику
+3. Запасной вариант → `idle` с причиной `"no reachable sources in range"`
 
 **Интересный паттерн — досыпка до полного:**
 
 ```lua
 -- Крип с [30/50] рядом с источником НЕ идёт на спавн
 -- Он остаётся добывать, пока не заполнит carry полностью
-if ctx.carry >= ctx.carry_capacity or not source_ok then
+if full or source_gone then
     -- Только тогда идём доставлять
 end
 ```
 
 Это эффективнее, чем «пошёл доставлять 10 единиц, потом вернулся за остальными».
 
-**Встроенная функция `distance()`:**
+**`find_path()` для определения расстояния:**
 
 ```lua
-local d = distance(ctx.pos, source.pos)  -- Манхэттенское расстояние
-if d <= 1 then
-    -- Рядом — можно действовать
+local path = find_path(ctx.pos, src.pos)
+if path then
+    local d = #path  -- длина пути в шагах
+    if d < best_dist then
+        best = src
+        best_dist = d
+    end
 end
 ```
 
 ---
 
-## 8. Как работает игровой тик (пошагово)
+### 6.3 Глобальные Lua-функции
+
+Помимо `distance()`, в Lua доступны глобальные функции, зарегистрированные через `World::register_lua_functions()`:
+
+#### `find_path(from, to [, opts])` — A* поиск пути
+
+```lua
+local path = find_path({x = 1, y = 1}, {x = 10, y = 5})
+if path then
+    -- path[1] = {x=1, y=1}  (старт)
+    -- path[2] = {x=2, y=1}  (первый шаг)
+    -- ...
+    -- path[N] = {x=10, y=5} (цель)
+    local dist = #path
+end
+
+-- С обходом болота:
+local safe_path = find_path({x = 1, y = 1}, {x = 10, y = 5}, { avoid = "swamp" })
+```
+
+**Параметры:**
+
+| Параметр | Тип | Описание |
+|----------|-----|----------|
+| `from` | `{x, y}` | Стартовая позиция |
+| `to` | `{x, y}` | Целевая позиция |
+| `opts` | таблица (опционально) | `opts.avoid = "swamp"` — обходить болота |
+
+**Возвращает:** Массив таблиц `{x, y}` (полный путь, включая старт и цель), или `nil` если путь не найден.
+
+**Автоматическое перенаправление:** Если цель непроходима (стена, источник, спавн), `find_path` автоматически перенаправляет на ближайшую проходимую смежную клетку (`find_adjacent_walkable`). Если цель полностью окружена непроходимыми клетками — возвращает `nil`.
+
+#### `get_tile(x, y)` — информация о тайле
+
+```lua
+local tile = get_tile(5, 3)  -- "plain", "wall", "swamp" или nil (вне карты)
+```
+
+**Возвращает:** Строка с типом тайла, или `nil` если координаты вне карты.
+
+#### `distance(a, b)` — Манхэттенское расстояние
+
+```lua
+local d = distance({x = 1, y = 1}, {x = 3, y = 4})  -- 5
+```
+
+Зарегистрирован в `ScriptEngine::new()` (не зависит от World). Простая и быстрая функция — используется для грубых оценок расстояния. Для точного «可达» расстояния (с учётом стен) используйте `find_path()`.
+
+---
+
+## 7. Как работает игровой тик (пошагово)
 
 Полный цикл одного тика, для одного крипа:
 
 ```
 1. Rust: world.tick(&engine)
     │
-    ├─ 2. Собираем ID всех крипов: ["worker_1", "worker_2"]
+    ├─ 2. Собираем ID всех крипов: ["worker_1"]
     │
     ├─ 3. Для worker_1:
+    │     ├─ [tracing::info_span!("creep", id="worker_1", tick=42)]
     │     ├─ 3a. get_entity("worker_1").cloned() → Entity { pos: (9,4), carry: 30, ... }
     │     ├─ 3b. build_unit_context(&creep) → UnitContext {
     │     │       id: "worker_1", pos: {x:9, y:4}, carry: 30,
-    │     │       nearby_sources: [{ id: "source1", pos: {x:9,y:5}, resource_amount: 950 }],
+    │     │       nearby_sources: [{ id: "source_1", pos: {x:26,y:1}, resource_amount: 950 }],
     │     │       nearby_spawns: [{ id: "spawn1", pos: {x:2,y:2}, resource_amount: 300 }],
     │     │       ...
     │     │   }
     │     ├─ 3c. context_to_lua(ctx) → Lua-таблица
-    │     ├─ 3d. Lua: decide(ctx_table) → { type: "harvest", target_id: "source1" }
-    │     ├─ 3e. parse_action(result) → Action::Harvest { target_id: "source1" }
-    │     └─ 3f. apply_action("worker_1", Harvest { target_id: "source1" })
-    │           ├─ Проверяем: distance(worker_1, source1) = 1 ✓
-    │           ├─ Проверяем: can_work() = true ✓
-    │           ├─ Проверяем: has_capacity() = true (30 < 50) ✓
-    │           ├─ amount = min(10, 950, 20) = 10
-    │           ├─ source1.resource_amount: 950 → 940
-    │           └─ worker_1.carry: 30 → 40
+    │     ├─ 3d. Lua: decide(ctx_table) →
+    │     │       Action::MoveTo { target: {x:26, y:1}, reason: "going to source (dist 59)" }
+    │     ├─ 3e. parse_action(result) → Action::MoveTo { target: {x:26, y:1}, reason: "..." }
+    │     └─ 3f. apply_action("worker_1", MoveTo { target: {x:26, y:1} })
+    │           ├─ find_nearest_walkable((26,1), 10) → (26,0)
+    │           │   (source непроходим → перенаправляем на соседнюю клетку)
+    │           ├─ planned_path пуст → пересчитываем
+    │           ├─ astar(creep.pos, (26,0)) → path[59]
+    │           ├─ move_speed() = 2, walk 2 steps along path
+    │           │   (step 1: Plain, cost 1, remaining 1)
+    │           │   (step 2: Plain, cost 1, remaining 0)
+    │           ├─ cache remaining path[57] with current pos at index 0
+    │           └─ worker_1.pos: (9,4) → (11,4)
     │
-    ├─ 4. Для worker_2: (тот же процесс)
-    │
-    └─ 5. tick += 1  (теперь tick = N+1)
+    └─ 4. tick += 1  (теперь tick = 43)
 
-6. Rust: world.render()
+5. Rust: world.render()
     └─ Отрисовка карты в терминал
 
-7. thread::sleep(300ms)
+6. thread::sleep(30ms)
     └─ Пауза до следующего тика
 ```
 
+**Что происходит в логах (logs/rust-creeps.log):**
+
+```
+2024-xx-xx ... INFO creep{id="worker_1" tick=42}: path move
+  from.x=9 from.y=4 to.x=11 to.y=4 steps=2 path_remaining=57 reason="going to source (dist 59)"
+```
+
+Tracing span автоматически добавляет `creep{id="worker_1" tick=42}` ко всем вложенным логам — легко фильтровать по конкретному крипа или тику.
+
 ---
 
-## 9. Зависимости (Cargo.toml)
+## 8. Зависимости (Cargo.toml)
 
 ```toml
 mlua = { version = "0.10", features = ["luajit52", "vendored", "serialize"] }
@@ -1005,15 +1348,20 @@ serde_json = "1"
 ```toml
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tracing-appender = "0.2"
 ```
 
-Фреймворк логирования. **В текущем коде не используется.** Зарезервирован для отладки Lua-скриптов и профилирования.
+**Логирование — активно используется:**
+
+- `tracing` — фреймворк логирования. Используется в `world.rs`, `lua_api.rs`, `main.rs` для диагностики (инструментация `tick()`, `apply_action()`, pathfinding, sandbox setup). Макросы: `info!` — обычные события (движение, добыча), `warn!` — потенциальные проблемы (путь заблокирован, carry полный), `debug!` — детальная отладка (пересчёт путей), `error!` — ошибки Lua-скриптов.
+- `tracing-subscriber` — подключает бэкенд логирования. В текущей конфигурации — запись в файл. Легко заменить на консольный вывод или UI-layer.
+- `tracing-appender` — неблокирующая запись логов в файл. Логи пишутся в отдельном потоке, чтобы не замедлять игровой цикл. Используется с `tracing_appender::non_blocking()` и `rolling::never()`.
 
 ---
 
-## 10. Рекомендации по улучшению архитектуры
+## 9. Рекомендации по улучшению архитектуры
 
-### 10.1 Разделение логики и рендеринга
+### 9.1 Разделение логики и рендеринга
 
 **Проблема сейчас:** `World::render()` прямо внутри `world.rs` рисует ANSI-коды. Логика и графика смешаны.
 
@@ -1056,7 +1404,7 @@ let renderer: Box<dyn Renderer> = match args.renderer {
 
 ---
 
-### 10.2 Мультиплеер
+### 9.2 Мультиплеер
 
 **Архитектура для мультиплеера:**
 
@@ -1110,7 +1458,7 @@ let renderer: Box<dyn Renderer> = match args.renderer {
 
 ---
 
-### 10.3 Перезагрузка скриптов в реальном времени
+### 9.3 Перезагрузка скриптов в реальном времени
 
 **Проблема сейчас:** Скрипт загружается один раз при старте. Чтобы изменить логику — нужно перезапустить программу.
 
@@ -1163,10 +1511,11 @@ impl ScriptEngine {
 - В Screeps есть `Memory` — глобальный объект, который переживает перезагрузку. Нужно сериализовать `Memory` перед перезагрузкой и восстановить после
 - Проверять скрипты на ошибки ДО перезагрузки: загрузить в отдельную тестовую VM, и только если `decide()` отработал без ошибок — применять
 - Добавить HTTP-эндпоинт для загрузки скрипта из браузера (для веб-мультиплеера)
+- После перезагрузки скрипта нужно вызвать `world.register_lua_functions()` заново (глобальные функции Lua нужно перерегистрировать)
 
 ---
 
-### 10.4 Генерация карт
+### 9.4 Генерация карт
 
 **Проблема сейчас:** Карта — статический массив строк в `main.rs`. Каждое изменение — перекомпиляция.
 
@@ -1205,25 +1554,7 @@ impl ScriptEngine {
 
 ---
 
-### 10.5 Дополнительные улучшения
-
-**A* Pathfinding:**
-Заменить жадный `step_toward` на A* с библиотекой `pathfinding = "4"`:
-
-```rust
-use pathfinding::directed::astar::astar;
-
-pub fn find_path(&self, from: Position, to: Position) -> Option<Vec<Position>> {
-    astar(
-        &from,
-        |p| self.successors(*p),      // все проходимые соседи
-        |p| Self::distance(*p, to),    // эвристика — Манхэттен
-        |p| *p == to,                  // условие остановки
-    ).map(|(path, _cost)| path)
-}
-```
-
-Крип будет хранить путь (`Vec<Position>`) и выполнять по одному шагу за тик из пути.
+### 9.5 Дополнительные улучшения
 
 **Система Memory (персистентное хранилище):**
 
@@ -1251,7 +1582,7 @@ impl Memory {
     }
 
     pub fn after_tick(&mut self, engine: &ScriptEngine) {
-        // Сериализовать Lua-таблицу Memory → JSON
+        // Сериализовать Lua-таблица Memory → JSON
         let table: Table = engine.lua.globals().get("Memory")?;
         self.data = engine.lua_to_value(&table)?;
     }
@@ -1284,7 +1615,26 @@ end
 
 ---
 
-### 10.6 Резюме приоритетов улучшений
+### 9.6 Диагностика и мониторинг
+
+Текущая система логирования (`tracing`) — хорошая основа для развития мониторинга:
+
+1. **Tracing spans per creep** — уже реализовано. Каждый тик каждого крипа оборачивается в span с `id` и `tick`. Все вложенные логи (move, harvest, path) привязаны к creep'у.
+
+2. **Structured logging** — логи содержат структурированные поля (`from.x`, `to.y`, `steps`, `reason`), что позволяет фильтровать и анализировать их программно.
+
+3. **Будущий UI-layer** — текущая архитектура позволяет добавить tracing Layer, который будет отправлять события в реальном времени в браузерный UI или TUI-панель. Например:
+
+   ```rust
+   // В main.rs — будущий слой:
+   // .with(my_ui_layer)  // ← покажет live-логи в терминале
+   ```
+
+4. **Метрики производительности** — можно добавить `tracing-timing` или кастомный subscriber для замеров времени pathfinding, Lua execution и т.д.
+
+---
+
+### 9.7 Резюме приоритетов улучшений
 
 | Приоритет | Улучшение | Сложность | Ценность |
 |-----------|-----------|-----------|----------|
@@ -1292,7 +1642,6 @@ end
 | 2 | Перезагрузка скриптов (file watcher) | Низкая | Высокая — критично для комфортной разработки AI |
 | 3 | Загрузка карт из файлов | Низкая | Средняя — больше не нужно перекомпилировать |
 | 4 | Система Memory | Средняя | Высокая — координация между крипами |
-| 5 | A* Pathfinding | Средняя | Высокая — крипы перестанут застревать у стен |
-| 6 | Процедурная генерация карт | Средняя | Средняя — разнообразие |
-| 7 | Несколько скриптов / ролей | Средняя | Высокая — richer gameplay |
-| 8 | Мультиплеер (WebSocket) | Высокая | Очень высокая — но требует п.1 |
+| 5 | Процедурная генерация карт | Средняя | Средняя — разнообразие |
+| 6 | Несколько скриптов / ролей | Средняя | Высокая — richer gameplay |
+| 7 | Мультиплеер (WebSocket) | Высокая | Очень высокая — но требует п.1 |
