@@ -1,7 +1,7 @@
 use crate::lua_api::{Action, NearbyEntity, Position, ScriptEngine, UnitContext};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 // ═══════════════════════════════════════
 //  Типы тайлов и сущностей
@@ -367,10 +367,12 @@ pub struct World {
     pub height: usize,
     pub tiles: Vec<Vec<TileType>>,
     pub entities: Vec<Entity>,
+    entity_index: HashMap<String, usize>,
     pub tick: u64,
     pub view_range: i32,
     pub harvest_rate: u32,
-    pub last_action: Action,
+    pub source_regen_rate: u32,
+    pub max_source_amount: u32,
 }
 
 impl World {
@@ -435,17 +437,23 @@ impl World {
             }
         }
 
+        let entity_index: HashMap<String, usize> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.id.clone(), i))
+            .collect();
+
         let world = World {
             width,
             height,
             tiles,
             entities,
+            entity_index,
             tick: 0,
             view_range: 10,
             harvest_rate: 10,
-            last_action: Action::Idle {
-                reason: "world created".to_string(),
-            },
+            source_regen_rate: 1,
+            max_source_amount: 1000,
         };
 
         tracing::info!(
@@ -489,12 +497,13 @@ impl World {
             return Some(target);
         }
         let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-        let mut visited = vec![target];
+        let mut visited: HashSet<Position> = HashSet::new();
+        visited.insert(target);
         let w = self.width as i32;
         let h = self.height as i32;
         for _ in 1..=max_dist {
-            let mut frontier = Vec::new();
-            for pos in &visited {
+            let mut frontier: Vec<Position> = Vec::new();
+            for &pos in &visited {
                 for &(dx, dy) in &directions {
                     let next = Position { x: pos.x + dx, y: pos.y + dy };
                     if next.x >= 0 && next.y >= 0 && next.x < w && next.y < h {
@@ -507,7 +516,9 @@ impl World {
                     }
                 }
             }
-            visited.extend(frontier);
+            for pos in frontier {
+                visited.insert(pos);
+            }
             if visited.len() > (max_dist as usize * max_dist as usize * 4) {
                 break; // safety limit
             }
@@ -624,11 +635,15 @@ impl World {
     }
 
     pub fn get_entity(&self, id: &str) -> Option<&Entity> {
-        self.entities.iter().find(|e| e.id == id)
+        self.entity_index.get(id).map(|&idx| &self.entities[idx])
     }
 
     pub fn get_entity_mut(&mut self, id: &str) -> Option<&mut Entity> {
-        self.entities.iter_mut().find(|e| e.id == id)
+        if let Some(&idx) = self.entity_index.get(id) {
+            self.entities.get_mut(idx)
+        } else {
+            None
+        }
     }
 
     pub fn is_walkable(&self, pos: Position) -> bool {
@@ -696,6 +711,14 @@ impl World {
             }
         }
 
+        // Регенерация источников
+        for entity in &mut self.entities {
+            if entity.entity_type == EntityType::Source {
+                entity.resource_amount = (entity.resource_amount as u32 + self.source_regen_rate)
+                    .min(self.max_source_amount);
+            }
+        }
+
         let creep_ids: Vec<String> = self
             .entities
             .iter()
@@ -703,25 +726,32 @@ impl World {
             .map(|e| e.id.clone())
             .collect();
 
-        for creep_id in &creep_ids {
-            let creep = match self.get_entity(creep_id).cloned() {
-                Some(c) => c,
-                None => continue,
-            };
+        // Phase 1: Collect all creep snapshots and build contexts BEFORE any mutations
+        let creep_snapshots: Vec<(String, Entity)> = creep_ids
+            .iter()
+            .filter_map(|id| self.get_entity(id).cloned().map(|c| (id.clone(), c)))
+            .collect();
 
+        let mut actions: Vec<(String, Action)> = Vec::new();
+        for (creep_id, creep) in &creep_snapshots {
             let span = tracing::info_span!("creep", id = %creep_id, tick = self.tick);
             let _enter = span.enter();
 
-            let ctx = self.build_unit_context(&creep);
+            let ctx = self.build_unit_context(creep);
             let action = engine.call_decide(&ctx).unwrap_or_else(|err| {
                 tracing::error!(error = %err, "Lua error during decide()");
                 Action::Idle {
                     reason: format!("script error: {}", err),
                 }
             });
-            self.last_action = action.clone();
-            self.apply_action(creep_id, &action);
+            actions.push((creep_id.clone(), action));
         }
+
+        // Phase 2: Apply all actions
+        for (creep_id, action) in &actions {
+            self.apply_action(creep_id, action);
+        }
+
         self.tick += 1;
     }
 
@@ -1156,6 +1186,7 @@ impl World {
                         s.spawn_cooldown = SPAWN_COOLDOWN_TICKS;
                     }
                     self.entities.push(new_creep);
+                    self.entity_index.insert(creep_name, self.entities.len() - 1);
                 } else {
                     tracing::warn!(target_id = %target_id, "spawn failed: spawn not found");
                 }
@@ -1234,24 +1265,33 @@ impl World {
             }
         }
         println!();
-        print!("  ACTION: ");
-        match &self.last_action {
-            Action::Move { target, reason } => {
-                println!("MOVE -> ({},{})  [{}]", target.x, target.y, reason)
+        println!("  ACTIONS:");
+        let mut any_action = false;
+        for e in &self.entities {
+            if e.entity_type == EntityType::Creep {
+                if let Some(action) = &e.last_action {
+                    any_action = true;
+                    match action {
+                        Action::Move { target, reason } => {
+                            println!("    {} MOVE -> ({},{})  [{}]", e.id, target.x, target.y, reason)
+                        }
+                        Action::MoveTo { target, reason } => {
+                            println!("    {} MOVETO -> ({},{})  [{}]", e.id, target.x, target.y, reason)
+                        }
+                        Action::Harvest { target_id } => println!("    {} HARVEST from {}", e.id, target_id),
+                        Action::Transfer { target_id, resource, amount } => {
+                            println!("    {} TRANSFER {} {} -> {}", e.id, amount, resource, target_id)
+                        }
+                        Action::Idle { reason } => println!("    {} IDLE [{}]", e.id, reason),
+                        Action::Spawn { target_id, body, name } => {
+                            println!("    {} SPAWN {} body={:?} name={}", e.id, target_id, body, name)
+                        }
+                    }
+                }
             }
-            Action::MoveTo { target, reason } => {
-                println!("MOVETO -> ({},{})  [{}]", target.x, target.y, reason)
-            }
-            Action::Harvest { target_id } => println!("HARVEST from {}", target_id),
-            Action::Transfer {
-                target_id,
-                resource,
-                amount,
-            } => println!("TRANSFER {} {} -> {}", amount, resource, target_id),
-            Action::Idle { reason } => println!("IDLE [{}]", reason),
-            Action::Spawn { target_id, body, name } => {
-                println!("SPAWN {} body={:?} name={}", target_id, body, name)
-            }
+        }
+        if !any_action {
+            println!("    (none)");
         }
         println!();
         println!("  Legend: # wall | . plain | S spawn | E source | c/C creep");
@@ -1590,6 +1630,7 @@ mod tests {
             Position { x: 1, y: 2 },
             vec![BodyPart::Move, BodyPart::Work, BodyPart::Carry],
         ));
+        world.entity_index.insert("worker_2".to_string(), world.entities.len() - 1);
 
         // Ещё 2 тика — 2 крипа, каждый вызывает decide(), total_ticks = 3 + 2*2 = 7
         for _ in 0..2 {
