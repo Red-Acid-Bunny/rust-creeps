@@ -146,6 +146,48 @@ fn tile_move_cost(tile: TileType) -> u32 {
     }
 }
 
+/// Проверяет, проходима ли позиция (учитывает тайлы и блокеры).
+fn is_pos_walkable(
+    tiles: &[Vec<TileType>],
+    pos: Position,
+    width: i32,
+    height: i32,
+    blockers: &[Position],
+) -> bool {
+    if !in_bounds(pos, width, height) {
+        return false;
+    }
+    if tiles[pos.y as usize][pos.x as usize] == TileType::Wall {
+        return false;
+    }
+    if blockers.contains(&pos) {
+        return false;
+    }
+    true
+}
+
+/// Ищет ближайшую проходимую клетку, смежную с pos (distance = 1).
+/// Возвращает None если все 4 соседа непроходимы.
+fn find_adjacent_walkable(
+    tiles: &[Vec<TileType>],
+    pos: Position,
+    width: i32,
+    height: i32,
+    blockers: &[Position],
+) -> Option<Position> {
+    let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+    for &(dx, dy) in &directions {
+        let next = Position {
+            x: pos.x + dx,
+            y: pos.y + dy,
+        };
+        if is_pos_walkable(tiles, next, width, height, blockers) {
+            return Some(next);
+        }
+    }
+    None
+}
+
 /// A* поиск пути. Возвращает полный путь (включая from и to) или None.
 ///
 /// - `avoid_swamp = true` → swamp treated as walls (no swamp in path)
@@ -394,6 +436,40 @@ impl World {
             .collect()
     }
 
+    /// BFS от целевой позиции — находит ближайшую проходимую клетку.
+    /// Используется когда цель сама непроходима (стена, источник, спавн).
+    /// Возвращает None если проходимых клеток нет в радиусе max_dist.
+    fn find_nearest_walkable(&self, target: Position, max_dist: u32) -> Option<Position> {
+        if self.is_walkable(target) {
+            return Some(target);
+        }
+        let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+        let mut visited = vec![target];
+        let w = self.width as i32;
+        let h = self.height as i32;
+        for _ in 1..=max_dist {
+            let mut frontier = Vec::new();
+            for pos in &visited {
+                for &(dx, dy) in &directions {
+                    let next = Position { x: pos.x + dx, y: pos.y + dy };
+                    if next.x >= 0 && next.y >= 0 && next.x < w && next.y < h {
+                        if !visited.contains(&next) && !frontier.contains(&next) {
+                            if self.is_walkable(next) {
+                                return Some(next);
+                            }
+                            frontier.push(next);
+                        }
+                    }
+                }
+            }
+            visited.extend(frontier);
+            if visited.len() > (max_dist as usize * max_dist as usize * 4) {
+                break; // safety limit
+            }
+        }
+        None
+    }
+
     /// Регистрирует глобальные Lua-функции, зависящие от состояния мира.
     /// Вызывать один раз после создания World и ScriptEngine.
     pub fn register_lua_functions(&self, engine: &ScriptEngine) -> mlua::Result<()> {
@@ -430,7 +506,22 @@ impl World {
                         false
                     };
 
-                    match astar(&tiles_fp, w, h, &bl, from_pos, to_pos, avoid_swamp) {
+                    // find_path: если цель непроходима, автоматически перенаправляет
+                    // на ближайшую проходимую клетку. Если цели нельзя достичь
+                    // для взаимодействия (нет walkable клетки на dist 1), возвращает nil.
+                    let effective_to = if is_pos_walkable(&tiles_fp, to_pos, w, h, &bl) {
+                        to_pos
+                    } else {
+                        match find_adjacent_walkable(&tiles_fp, to_pos, w, h, &bl) {
+                            Some(p) => p,
+                            None => {
+                                // Цель полностью окружена — недоступна
+                                return Ok(mlua::Value::Nil);
+                            }
+                        }
+                    };
+
+                    match astar(&tiles_fp, w, h, &bl, from_pos, effective_to, avoid_swamp) {
                         Some(positions) => {
                             let table = lua.create_table()?;
                             for (i, pos) in positions.iter().enumerate() {
@@ -696,22 +787,22 @@ impl World {
                         return;
                     }
 
-                    // Если цель непроходима (стена, источник, спавн), ищем ближайшую
-                    // смежную проходимую клетку — крип подходит к ней и может
-                    // взаимодействовать с целью (harvest, transfer) с distance <= 1.
-                    let effective_target = if self.is_walkable(*target) {
-                        *target
-                    } else {
-                        let directions: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-                        directions
-                            .iter()
-                            .map(|(dx, dy)| Position {
-                                x: target.x + dx,
-                                y: target.y + dy,
-                            })
-                            .find(|p| self.is_walkable(*p))
-                            .unwrap_or(*target)
-                    };
+                    // Если цель непроходима (стена, источник, спавн), BFS-ом ищем
+                    // ближайшую проходимую клетку. Радиус 10 покрывает любую разумную карту.
+                    let effective_target = self
+                        .find_nearest_walkable(*target, 10)
+                        .unwrap_or(*target);
+
+                    if !self.is_walkable(effective_target) {
+                        // Даже BFS ничего не нашёл — цель полностью окружена
+                        if creep.planned_path.is_empty() {
+                            tracing::warn!(
+                                target.x = target.x, target.y = target.y,
+                                "target completely surrounded, no walkable cell nearby"
+                            );
+                        }
+                        return;
+                    }
 
                     // Пересчитываем путь, если он пустой или ведёт к другой цели
                     let needs_recompute = creep.planned_path.is_empty()
