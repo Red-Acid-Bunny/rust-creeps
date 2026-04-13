@@ -62,12 +62,43 @@ impl UnitContext {
     }
 }
 
-/// Форматирует Lua-число (Integer или Number) в строку.
-fn fmt_num(val: &mlua::Value) -> String {
-    match val {
+/// Рекурсивно форматирует Lua-значение в компактную строку.
+/// depth — глубина рекурсии (лимит 2 уровня для компактности).
+fn format_lua_value(value: &mlua::Value, depth: usize) -> String {
+    if depth > 2 {
+        return "{...}".to_string();
+    }
+    match value {
+        mlua::Value::Nil => "nil".to_string(),
+        mlua::Value::Boolean(b) => b.to_string(),
         mlua::Value::Integer(n) => n.to_string(),
         mlua::Value::Number(n) => format!("{:.0}", n),
-        _ => "?".to_string(),
+        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+        mlua::Value::Table(t) => {
+            let mut parts: Vec<String> = Vec::new();
+            for pair in t.pairs::<mlua::Value, mlua::Value>() {
+                if let Ok((k, v)) = pair {
+                    let key_str = match &k {
+                        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+                        mlua::Value::Integer(i) => i.to_string(),
+                        mlua::Value::Number(n) => format!("{:.0}", n),
+                        _ => "?".to_string(),
+                    };
+                    let val_str = format_lua_value(&v, depth + 1);
+                    parts.push(format!("{}={}", key_str, val_str));
+                }
+            }
+            if parts.is_empty() {
+                "{}".to_string()
+            } else {
+                format!("{{{}}}", parts.join(", "))
+            }
+        }
+        mlua::Value::Function(_) => "[function]".to_string(),
+        mlua::Value::UserData(_) | mlua::Value::LightUserData(_) => "[userdata]".to_string(),
+        mlua::Value::Thread(_) => "[thread]".to_string(),
+        mlua::Value::Error(e) => format!("[error: {}]", e),
+        _ => "[?]".to_string(),
     }
 }
 
@@ -80,11 +111,73 @@ impl ScriptEngine {
         tracing::debug!("creating Lua VM with sandbox");
         let lua = Lua::new();
         lua.load(r#"
-            function distance(a, b) return math.abs(a.x - b.x) + math.abs(a.y - b.y) end
+            -- Block dangerous globals
             os, io, debug, require, dofile, loadfile, load, package = nil, nil, nil, nil, nil, nil, nil, nil
+
+            -- Block dangerous string functions
+            local _string = string
+            local _safe_string = {
+                byte = _string.byte,
+                char = _string.char,
+                find = _string.find,
+                format = _string.format,
+                gmatch = _string.gmatch,
+                gsub = _string.gsub,
+                len = _string.len,
+                lower = _string.lower,
+                match = _string.match,
+                rep = _string.rep,
+                reverse = _string.reverse,
+                sub = _string.sub,
+                upper = _string.upper,
+            }
+            string = setmetatable(_safe_string, {
+                __index = function(_, key) return nil end,
+                __newindex = function(_, key, value)
+                    if _safe_string[key] ~= nil or key == "dump" then
+                        -- silently block reassignment of dangerous functions
+                        return
+                    end
+                    rawset(_safe_string, key, value)
+                end,
+            })
+
+            -- Lock down metatables to prevent sandbox escape
             local _mt = getmetatable(_G) or {}
             _mt.__index = function(_, key) return nil end
+            _mt.__newindex = function(_, key, value)
+                if key == "string" or key == "table" or key == "math" or key == "coroutine" then
+                    return -- prevent replacing safe libraries
+                end
+                rawset(_G, key, value)
+            end
             setmetatable(_G, _mt)
+
+            -- Prevent debug library access through metatable manipulation
+            local _table = table
+            table = setmetatable({}, {
+                __index = function(_, key)
+                    if key == "getmetatable" or key == "setmetatable" then
+                        return nil -- block metatable access through table library
+                    end
+                    return _table[key]
+                end,
+            })
+
+            -- Limit coroutine (can be used to escape sandbox)
+            local _coroutine = coroutine
+            coroutine = setmetatable({
+                create = _coroutine.create,
+                resume = _coroutine.resume,
+                running = _coroutine.running,
+                status = _coroutine.status,
+                wrap = _coroutine.wrap,
+                yield = _coroutine.yield,
+            }, {
+                __index = function(_, key) return nil end,
+            })
+
+            function distance(a, b) return math.abs(a.x - b.x) + math.abs(a.y - b.y) end
         "#)
         .exec()?;
 
@@ -162,57 +255,28 @@ impl ScriptEngine {
     }
 
     /// Возвращает форматированную строку с содержимым Memory для отображения в UI.
+    /// Работает с любой структурой Memory — не привязан к конкретной схеме.
     pub fn format_memory(&self) -> LuaResult<String> {
         self.with_lua(|lua| {
             let memory: mlua::Table = lua.globals().get("Memory")?;
             let mut lines = Vec::new();
-
-            // spawn_count
-            let count: mlua::Value = memory.get("spawn_count")?;
-            if let mlua::Value::Integer(n) = count {
-                lines.push(format!("  spawn_count: {}", n));
-            }
-
-            // creeps
-            let creeps: mlua::Value = memory.get("creeps")?;
-            if let mlua::Value::Table(t) = creeps {
-                let mut entries: Vec<(String, String)> = Vec::new();
-                for pair in t.pairs::<mlua::Value, mlua::Table>() {
-                    if let (mlua::Value::String(id), Ok(info)) = pair {
-                        let tick: mlua::Value = info.get("tick")?;
-                        let carry: mlua::Value = info.get("carry")?;
-                        let pos: mlua::Value = info.get("pos")?;
-                        let pos_str = if let mlua::Value::Table(p) = pos {
-                            let x: mlua::Value = p.get("x")?;
-                            let y: mlua::Value = p.get("y")?;
-                            format!("({},{})", fmt_num(&x), fmt_num(&y))
-                        } else {
-                            "?".to_string()
-                        };
-                        entries.push((
-                            id.to_string_lossy().to_string(),
-                            format!(
-                                "tick:{} carry:{} pos:{}",
-                                fmt_num(&tick),
-                                fmt_num(&carry),
-                                pos_str
-                            ),
-                        ));
-                    }
-                }
-                entries.sort_by(|a, b| a.0.cmp(&b.0));
-                if !entries.is_empty() {
-                    lines.push(format!("  creeps ({}):", entries.len()));
-                    for (id, info) in &entries {
-                        lines.push(format!("    {}  {}", id, info));
-                    }
+            for pair in memory.pairs::<mlua::Value, mlua::Value>() {
+                if let Ok((k, v)) = pair {
+                    let key_str = match &k {
+                        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+                        mlua::Value::Integer(i) => i.to_string(),
+                        mlua::Value::Number(n) => format!("{:.0}", n),
+                        _ => continue,
+                    };
+                    let val_str = format_lua_value(&v, 1);
+                    lines.push(format!("  {} = {}", key_str, val_str));
                 }
             }
-
             if lines.is_empty() {
-                lines.push("  (empty)".to_string());
+                Ok("  (empty)".to_string())
+            } else {
+                Ok(lines.join("\n"))
             }
-            Ok(lines.join("\n"))
         })
     }
 
